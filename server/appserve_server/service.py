@@ -28,7 +28,7 @@ class RelayRuntime:
             if request.get("type") != "join":
                 await send_json(writer, {"ok": False, "error": "invalid_bootstrap"})
                 return
-            payload = parse_bootstrap(self.config, base64.urlsafe_b64decode(request["payload"]))
+            payload = parse_bootstrap(self.config, request["payload"].encode("ascii"))
             client_id = payload["client_id"]
             client_key = payload["client_public_key"]
             self.state.register_client(client_id, client_key)
