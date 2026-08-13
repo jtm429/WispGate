@@ -59,7 +59,7 @@ private fun WispGateApp(client: RelayClient) {
 
     if (server == null) {
         SetupScreen(
-            onSave = { host, key ->
+            onSave = { host, key, controlPort, relayPort ->
                 val info = RelayClient.ServerInfo(host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt())
                 client.saveServer(info)
                 server = info
@@ -129,7 +129,7 @@ private fun WispGateApp(client: RelayClient) {
 }
 
 @Composable
-private fun SetupScreen(onSave: (String, String) -> Unit) {
+private fun SetupScreen(onSave: (String, String, String, String) -> Unit) {
     var host by remember { mutableStateOf("") }
     var key by remember { mutableStateOf("") }
     var controlPort by remember { mutableStateOf("443") }
@@ -149,7 +149,7 @@ private fun SetupScreen(onSave: (String, String) -> Unit) {
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(relayPort, { relayPort = it }, label = { Text("Relay port") }, singleLine = true)
         Spacer(Modifier.height(20.dp))
-        Button(enabled = host.isNotBlank() && key.isNotBlank() && controlPort.toIntOrNull() != null && relayPort.toIntOrNull() != null, onClick = { onSave(host, key) }) {
+        Button(enabled = host.isNotBlank() && key.isNotBlank() && controlPort.toIntOrNull() != null && relayPort.toIntOrNull() != null, onClick = { onSave(host, key, controlPort, relayPort) }) {
             Text("Save and connect")
         }
     }
