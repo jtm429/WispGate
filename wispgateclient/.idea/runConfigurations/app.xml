@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" type="AndroidRunConfigurationType" factoryName="Android App">
+    <option name="DEPLOY" value="true" />
+    <option name="ACTIVITY_CLASS" value="com.example.wispgateclient.MainActivity" />
+    <option name="MODE" value="default_cp" />
+    <option name="CLEAR_LOGCAT" value="false" />
+    <option name="SHOW_LOGCAT" value="true" />
+    <option name="TARGET_SELECTION_MODE" value="DEVICE_AND_SNAPSHOT" />
+    <module name="WispGateClient.app" />
+  </configuration>
+</component>
