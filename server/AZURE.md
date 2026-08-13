@@ -94,10 +94,10 @@ The relay state file and private key are in `/var/lib/wispgate`, so they survive
 
 ## Current MVP limitations
 
-- The service currently uses newline-delimited JSON over two asyncio TCP ports.
+- The current service uses newline-delimited JSON over two asyncio TCP ports.
 - The bootstrap payload is encrypted to the relay RSA public key.
 - The application envelope's `ciphertext` is treated as opaque, but this MVP does not yet implement client-side end-to-end session-key negotiation.
-- TLS certificate configuration is not yet wired into the service; expose the ports only behind an Azure TLS terminator or add server-side TLS before internet deployment.
+- The sockets are currently plaintext TCP. Before public deployment, add TLS termination in front of both ports or wire `ssl.SSLContext` into `asyncio.start_server`.
 - The relay startup reconnect behavior is represented in the protocol design, but direct relay-initiated NAT reconnection requires a future transport implementation. Clients' reconnect loops work with this MVP.
 
 Do not expose the current MVP directly to the public internet until TLS and the remaining client authentication/session work are implemented.

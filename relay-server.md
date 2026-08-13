@@ -25,7 +25,7 @@ webapp host  ──outbound──> control port
 
 The server may push messages over either established connection. Clients do not need router port forwarding.
 
-Both ports should use TLS in deployment. TLS protects the transport and client credentials; application payloads are encrypted separately so a compromised relay cannot read them.
+The current service is a plaintext asyncio TCP MVP with encrypted bootstrap/application fields. Do not open these ports to the public internet without adding TLS termination in front of both ports or wiring an `ssl.SSLContext` into the service. The Azure deployment steps below are for a private test deployment unless that TLS step has been completed.
 
 ## Startup and availability
 
