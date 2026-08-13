@@ -19,6 +19,7 @@ class RelayClient(private val context: Context) {
     data class ServerInfo(val host: String, val publicKey: String, val controlPort: Int = 443, val relayPort: Int = 4443)
     data class Wisp(val id: String, val name: String, val description: String, val owner: String)
     data class WispState(val wispId: String, val html: String)
+    data class ConnectionResult(val wisps: List<Wisp>, val sessionToken: String)
 
     private val preferences = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
 
@@ -33,7 +34,7 @@ class RelayClient(private val context: Context) {
             .putInt("control_port", info.controlPort).putInt("relay_port", info.relayPort).apply()
     }
 
-    suspend fun listWisps(info: ServerInfo): List<Wisp> = withContext(Dispatchers.IO) {
+    suspend fun connectAndListWisps(info: ServerInfo): ConnectionResult = withContext(Dispatchers.IO) {
         val clientId = "android-user"
         Socket(info.host, info.controlPort).use { socket ->
             socket.soTimeout = 10_000
@@ -55,8 +56,9 @@ class RelayClient(private val context: Context) {
             }
             send(output, JSONObject().put("type", "wisps").put("items", JSONArray()).toString())
             input.readLine()
-            preferences.edit().putString("session_token", joined.getString("session_token")).apply()
-            wisps
+            val sessionToken = joined.getString("session_token")
+            preferences.edit().putString("session_token", sessionToken).apply()
+            ConnectionResult(wisps, sessionToken)
         }
     }
 

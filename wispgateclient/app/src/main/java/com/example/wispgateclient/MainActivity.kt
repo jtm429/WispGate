@@ -22,6 +22,8 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -56,6 +58,7 @@ private fun WispGateApp(client: RelayClient) {
     var html by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
+    var connected by remember { mutableStateOf(false) }
 
     if (server == null) {
         SetupScreen(
@@ -86,41 +89,72 @@ private fun WispGateApp(client: RelayClient) {
         return
     }
 
-    LaunchedEffect(server) {
-        loading = true
-        error = null
-        try {
-            wisps = client.listWisps(server!!)
-        } catch (cause: Throwable) {
-            error = cause.message ?: "Unable to connect to relay"
-        } finally {
-            loading = false
+    fun refresh() {
+        scope.launch {
+            loading = true
+            error = null
+            try {
+                val result = client.connectAndListWisps(server!!)
+                wisps = result.wisps
+                connected = true
+            } catch (cause: Throwable) {
+                connected = false
+                wisps = emptyList()
+                error = cause.message ?: "Unable to connect to relay"
+            } finally {
+                loading = false
+            }
         }
+    }
+
+    LaunchedEffect(server) { refresh() }
+
+    val refreshState = rememberPullToRefreshState()
+    val statusText = when {
+        loading -> "Connecting to relay…"
+        !connected -> "Not connected to relay"
+        wisps.isEmpty() -> "Connected to relay · no Wisps available"
+        else -> "Connected to relay · ${wisps.size} Wisp${if (wisps.size == 1) "" else "s"} available"
     }
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         Text("WispGate", style = MaterialTheme.typography.headlineMedium)
         Text("Available Wisps", style = MaterialTheme.typography.titleMedium)
+        Text(
+            statusText,
+            color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodyMedium,
+        )
         Spacer(Modifier.height(12.dp))
-        if (loading) CircularProgressIndicator()
-        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-        if (!loading && wisps.isEmpty() && error == null) Text("No Wisps are currently connected.")
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(wisps) { wisp ->
-                Card(Modifier.fillMaxWidth().clickable {
-                    selected = wisp
-                    scope.launch {
-                        try {
-                            html = client.requestState(server!!, wisp).html
-                        } catch (cause: Throwable) {
-                            error = cause.message ?: "Unable to request Wisp state"
-                            selected = null
+        PullToRefreshBox(
+            isRefreshing = loading,
+            onRefresh = ::refresh,
+            state = refreshState,
+            modifier = Modifier.fillMaxSize(),
+        ) {
+            Column {
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                if (!loading && connected && wisps.isEmpty()) {
+                    Text("The relay is reachable, but no Wisps are currently connected.")
+                }
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(wisps) { wisp ->
+                        Card(Modifier.fillMaxWidth().clickable {
+                            selected = wisp
+                            scope.launch {
+                                try {
+                                    html = client.requestState(server!!, wisp).html
+                                } catch (cause: Throwable) {
+                                    error = cause.message ?: "Unable to request Wisp state"
+                                    selected = null
+                                }
+                            }
+                        }) {
+                            Column(Modifier.padding(16.dp)) {
+                                Text(wisp.name, style = MaterialTheme.typography.titleLarge)
+                                Text(wisp.description)
+                            }
                         }
-                    }
-                }) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text(wisp.name, style = MaterialTheme.typography.titleLarge)
-                        Text(wisp.description)
                     }
                 }
             }
