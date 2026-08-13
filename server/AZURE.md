@@ -41,7 +41,7 @@ sudo -u wisp /opt/wispgate/.venv/bin/pip install -r /opt/wispgate/server/require
 The private key must persist across VM shutdowns. Do not regenerate it during each boot.
 
 ```bash
-sudo -u wisp /opt/wispgate/.venv/bin/python -c "from pathlib import Path; from appserve_server.core import generate_server_keypair; print(generate_server_keypair(Path('/var/lib/wispgate/server-key.pem')))"
+sudo -u wisp bash -c 'cd /opt/wispgate/server && /opt/wispgate/.venv/bin/python -c "from pathlib import Path; from appserve_server.core import generate_server_keypair; print(generate_server_keypair(Path(\"/var/lib/wispgate/server-key.pem\")))"'
 sudo chmod 600 /var/lib/wispgate/server-key.pem
 ```
 

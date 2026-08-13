@@ -31,7 +31,7 @@ class PrimeWisp:
             "content_type": "text/html",
             "html": f"""
             <main style='min-height:100vh;display:flex;align-items:center;justify-content:center'>
-              <form id='prime-form' style='display:flex;flex-direction:column;gap:12px;align-items:center'>
+              <form id='prime-form' onsubmit='event.preventDefault(); window.WispGate.submit(JSON.stringify({{type:"submit", number:this.number.value}}))' style='display:flex;flex-direction:column;gap:12px;align-items:center'>
                 <input name='number' type='number' placeholder='Enter a number' autofocus />
                 <button type='submit'>Is it prime?</button>
                 <output>{message}</output>

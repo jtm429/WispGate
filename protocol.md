@@ -53,6 +53,27 @@ The user client is allowed to remain unchanged indefinitely after displaying a r
 
 An action is an applet-defined event payload. A response is an applet-defined complete UI/state payload. The protocol carries both as opaque encrypted application data and does not require typed inputs, fixed controls, or a standard widget vocabulary.
 
+## Catalog and resend-state action
+
+When a Wisp client joins, it registers its manifest:
+
+```json
+{
+  "type": "wisps",
+  "items": [{"id": "prime", "name": "Prime tester", "description": "..."}]
+}
+```
+
+The relay persists the catalog metadata and returns it to user clients during join. The user client can display this as a contacts-like list without knowing anything about the Wisp's UI.
+
+Selecting a Wisp sends a generic, non-mutating state request:
+
+```json
+{"wisp_id": "prime", "action": "state_request"}
+```
+
+The Wisp responds with its current complete UI/state. This request must not advance the Wisp's turn or invoke its ordinary action handler. Other UI events are sent as applet-defined actions and may advance the turn.
+
 ## Relay restart and client resumption
 
 The relay persists client registration records and the information needed to attempt reconnection after an Azure VM restart. On startup it loads that state and tries to re-establish sessions with clients previously connected to the deployment.
