@@ -60,7 +60,7 @@ private fun WispGateApp(client: RelayClient) {
     if (server == null) {
         SetupScreen(
             onSave = { host, key ->
-                val info = RelayClient.ServerInfo(host.trim(), key.trim())
+                val info = RelayClient.ServerInfo(host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt())
                 client.saveServer(info)
                 server = info
             },
@@ -132,6 +132,8 @@ private fun WispGateApp(client: RelayClient) {
 private fun SetupScreen(onSave: (String, String) -> Unit) {
     var host by remember { mutableStateOf("") }
     var key by remember { mutableStateOf("") }
+    var controlPort by remember { mutableStateOf("443") }
+    var relayPort by remember { mutableStateOf("4443") }
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
@@ -142,8 +144,12 @@ private fun SetupScreen(onSave: (String, String) -> Unit) {
         OutlinedTextField(host, { host = it }, label = { Text("Relay IP or hostname") }, singleLine = true)
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(key, { key = it }, label = { Text("Relay public key") }, singleLine = true)
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(controlPort, { controlPort = it }, label = { Text("Control port") }, singleLine = true)
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(relayPort, { relayPort = it }, label = { Text("Relay port") }, singleLine = true)
         Spacer(Modifier.height(20.dp))
-        Button(enabled = host.isNotBlank() && key.isNotBlank(), onClick = { onSave(host, key) }) {
+        Button(enabled = host.isNotBlank() && key.isNotBlank() && controlPort.toIntOrNull() != null && relayPort.toIntOrNull() != null, onClick = { onSave(host, key) }) {
             Text("Save and connect")
         }
     }

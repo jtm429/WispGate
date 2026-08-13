@@ -15,11 +15,8 @@ import java.security.KeyFactory
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
 
-private const val CONTROL_PORT = 443
-private const val RELAY_PORT = 4443
-
 class RelayClient(private val context: Context) {
-    data class ServerInfo(val host: String, val publicKey: String)
+    data class ServerInfo(val host: String, val publicKey: String, val controlPort: Int = 443, val relayPort: Int = 4443)
     data class Wisp(val id: String, val name: String, val description: String, val owner: String)
     data class WispState(val wispId: String, val html: String)
 
@@ -28,16 +25,17 @@ class RelayClient(private val context: Context) {
     fun savedServer(): ServerInfo? {
         val host = preferences.getString("host", null) ?: return null
         val key = preferences.getString("public_key", null) ?: return null
-        return ServerInfo(host, key)
+        return ServerInfo(host, key, preferences.getInt("control_port", 443), preferences.getInt("relay_port", 4443))
     }
 
     fun saveServer(info: ServerInfo) {
-        preferences.edit().putString("host", info.host).putString("public_key", info.publicKey).apply()
+        preferences.edit().putString("host", info.host).putString("public_key", info.publicKey)
+            .putInt("control_port", info.controlPort).putInt("relay_port", info.relayPort).apply()
     }
 
     suspend fun listWisps(info: ServerInfo): List<Wisp> = withContext(Dispatchers.IO) {
         val clientId = "android-user"
-        Socket(info.host, CONTROL_PORT).use { socket ->
+        Socket(info.host, info.controlPort).use { socket ->
             socket.soTimeout = 10_000
             val input = socket.reader()
             val output = socket.writer()
@@ -64,7 +62,7 @@ class RelayClient(private val context: Context) {
 
     suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = withContext(Dispatchers.IO) {
         val token = preferences.getString("session_token", null) ?: error("Connect before requesting state")
-        Socket(info.host, RELAY_PORT).use { socket ->
+        Socket(info.host, info.relayPort).use { socket ->
             socket.soTimeout = 10_000
             val input = socket.reader()
             val output = socket.writer()
@@ -85,7 +83,7 @@ class RelayClient(private val context: Context) {
 
     suspend fun sendAction(info: ServerInfo, wisp: Wisp, action: String): WispState = withContext(Dispatchers.IO) {
         val token = preferences.getString("session_token", null) ?: error("Connect before sending action")
-        Socket(info.host, RELAY_PORT).use { socket ->
+        Socket(info.host, info.relayPort).use { socket ->
             socket.soTimeout = 10_000
             val input = socket.reader()
             val output = socket.writer()
