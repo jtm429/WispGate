@@ -93,6 +93,7 @@ class RelayState:
         self.max_queue_per_client = max_queue_per_client
         self.clients: dict[str, dict[str, Any]] = {}
         self.queues: dict[str, list[dict[str, Any]]] = {}
+        self.wisps: dict[str, dict[str, Any]] = {}
 
     def load(self) -> None:
         if not self.path.exists():
@@ -100,11 +101,12 @@ class RelayState:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         self.clients = data.get("clients", {})
         self.queues = data.get("queues", {})
+        self.wisps = data.get("wisps", {})
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"clients": self.clients, "queues": self.queues}), encoding="utf-8")
+        temporary.write_text(json.dumps({"clients": self.clients, "queues": self.queues, "wisps": self.wisps}), encoding="utf-8")
         temporary.replace(self.path)
 
     def register_client(self, client_id: str, public_key: str) -> None:

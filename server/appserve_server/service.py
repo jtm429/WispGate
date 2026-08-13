@@ -43,10 +43,25 @@ class RelayRuntime:
                     "client_id": client_id,
                     "session_token": token,
                     "queued": len(self.state.queues.get(client_id, [])),
+                    "wisps": list(self.state.wisps.values()),
                 },
             )
+            registration = await asyncio.wait_for(reader.readline(), timeout=2)
+            if registration:
+                message = json.loads(registration)
+                if message.get("type") == "wisps":
+                    for item in message.get("items", []):
+                        if item.get("id"):
+                            self.state.wisps[item["id"]] = {
+                                "id": item["id"],
+                                "name": item.get("name", item["id"]),
+                                "description": item.get("description", ""),
+                                "owner": client_id,
+                            }
+                    self.state.save()
+                    await send_json(writer, {"ok": True, "type": "wisps_registered", "items": list(self.state.wisps.values())})
             LOG.info("client joined: %s from %s", client_id, peer)
-        except (KeyError, ValueError, json.JSONDecodeError, base64.binascii.Error) as exc:
+        except (KeyError, ValueError, json.JSONDecodeError, base64.binascii.Error, asyncio.TimeoutError) as exc:
             LOG.warning("rejected join from %s: %s", peer, exc)
             await send_json(writer, {"ok": False, "error": "invalid_bootstrap"})
         finally:
