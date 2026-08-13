@@ -53,8 +53,8 @@ The command prints the base64url server public key. Put that value in each priva
 sudo cp /opt/wispgate/server/wispgate-relay.service /etc/systemd/system/wispgate-relay.service
 sudo systemctl daemon-reload
 sudo systemctl enable wispgate-relay
-sudo systemctl start wispgate-relay
-sudo systemctl status wispgate-relay
+sudo systemctl restart wispgate-relay
+sudo systemctl status wispgate-relay --no-pager
 ```
 
 `enable` is important: it makes the relay start immediately whenever the Azure VM boots. `Restart=always` restarts it if the process exits.
