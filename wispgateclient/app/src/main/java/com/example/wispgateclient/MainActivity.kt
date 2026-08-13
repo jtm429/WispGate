@@ -19,6 +19,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
@@ -59,6 +62,7 @@ private fun WispGateApp(client: RelayClient) {
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var connected by remember { mutableStateOf(false) }
+    var settingsOpen by remember { mutableStateOf(false) }
 
     if (server == null) {
         SetupScreen(
@@ -67,6 +71,21 @@ private fun WispGateApp(client: RelayClient) {
                 client.saveServer(info)
                 server = info
             },
+        )
+        return
+    }
+
+    if (settingsOpen) {
+        SettingsScreen(
+            initial = server!!,
+            onSave = { info ->
+                client.saveServer(info)
+                server = info
+                settingsOpen = false
+                selected = null
+                html = null
+            },
+            onCancel = { settingsOpen = false },
         )
         return
     }
@@ -118,7 +137,19 @@ private fun WispGateApp(client: RelayClient) {
     }
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
-        Text("WispGate", style = MaterialTheme.typography.headlineMedium)
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("WispGate", style = MaterialTheme.typography.headlineMedium)
+            IconButton(onClick = { settingsOpen = true }) {
+                androidx.compose.material3.Icon(
+                    imageVector = Icons.Default.Settings,
+                    contentDescription = "Relay settings",
+                )
+            }
+        }
         Text("Available Wisps", style = MaterialTheme.typography.titleMedium)
         Text(
             statusText,
