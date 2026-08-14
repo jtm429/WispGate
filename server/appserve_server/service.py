@@ -150,20 +150,24 @@ class RelayRuntime:
                 await send_json(session[1], {"ok": False, "error": "invalid_envelope"})
             return
         destination = self.sessions.get(recipient)
+        source = self.sessions.get(sender)
         if destination:
+            # The sender's transport is request/response oriented: it expects
+            # the relay acceptance before the recipient's application reply.
+            # Send this first so a fast Wisp response cannot race it.
+            if source:
+                await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
             await send_json(destination[1], envelope)
         else:
             body = envelope.get("body", {})
             if body.get("action") in {"state_request", "user_action"}:
-                source = self.sessions.get(sender)
                 if source:
                     await send_json(source[1], {"ok": False, "error": "recipient_offline"})
                 return
             self.state.queue(recipient, envelope)
             self.state.save()
-        source = self.sessions.get(sender)
-        if source:
-            await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
+            if source:
+                await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
 
 
 async def send_json(writer: asyncio.StreamWriter, value: dict[str, Any]) -> None:
