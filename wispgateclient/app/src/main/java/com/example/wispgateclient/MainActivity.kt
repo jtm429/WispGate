@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.wispgateclient.ui.theme.WispGateClientTheme
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -117,25 +118,28 @@ private fun WispGateApp(client: RelayClient) {
         return
     }
 
-    fun refresh() {
-        scope.launch {
-            loading = true
-            error = null
-            try {
-                val result = client.connectAndListWisps(server!!)
-                wisps = result.wisps
-                connected = true
-            } catch (cause: Throwable) {
-                connected = false
-                wisps = emptyList()
-                error = cause.message ?: "Unable to connect to relay"
-            } finally {
-                loading = false
-            }
+    suspend fun refresh() {
+        loading = true
+        error = null
+        try {
+            val result = client.connectAndListWisps(server!!)
+            wisps = result.wisps
+            connected = true
+        } catch (cause: Throwable) {
+            connected = false
+            wisps = emptyList()
+            error = cause.message ?: "Unable to connect to relay"
+        } finally {
+            loading = false
         }
     }
 
-    LaunchedEffect(server) { refresh() }
+    LaunchedEffect(server) {
+        while (!connected) {
+            refresh()
+            if (!connected) delay(5_000)
+        }
+    }
 
     val refreshState = rememberPullToRefreshState()
     val statusText = when {
@@ -165,10 +169,15 @@ private fun WispGateApp(client: RelayClient) {
             color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
             style = MaterialTheme.typography.bodyMedium,
         )
+        if (!loading && !connected) {
+            Button(onClick = { scope.launch { refresh() } }) {
+                Text("Retry connection")
+            }
+        }
         Spacer(Modifier.height(12.dp))
         PullToRefreshBox(
             isRefreshing = loading,
-            onRefresh = ::refresh,
+            onRefresh = { scope.launch { refresh() } },
             state = refreshState,
             modifier = Modifier.fillMaxSize(),
         ) {
