@@ -1,0 +1,1 @@
+wisp ALL=(root) NOPASSWD: /usr/local/sbin/wispgate-update

@@ -73,6 +73,8 @@ private fun WispGateApp(client: RelayClient) {
     var loading by remember { mutableStateOf(false) }
     var connected by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
+    var updatingServer by remember { mutableStateOf(false) }
+    var updateMessage by remember { mutableStateOf<String?>(null) }
 
     if (server == null) {
         SetupScreen(
@@ -135,9 +137,9 @@ private fun WispGateApp(client: RelayClient) {
     }
 
     LaunchedEffect(server) {
-        while (!connected) {
+        while (true) {
             refresh()
-            if (!connected) delay(5_000)
+            delay(5_000)
         }
     }
 
@@ -169,6 +171,28 @@ private fun WispGateApp(client: RelayClient) {
             color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
             style = MaterialTheme.typography.bodyMedium,
         )
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(
+                enabled = !updatingServer && server!!.updateToken.isNotBlank(),
+                onClick = {
+                    scope.launch {
+                        updatingServer = true
+                        updateMessage = null
+                        try {
+                            client.updateServer(server!!)
+                            updateMessage = "Server update started."
+                        } catch (cause: Throwable) {
+                            updateMessage = cause.message ?: "Unable to start server update"
+                        } finally {
+                            updatingServer = false
+                        }
+                    }
+                },
+            ) { Text(if (updatingServer) "Updating…" else "Update server") }
+            if (updateMessage != null) {
+                Text(updateMessage!!, style = MaterialTheme.typography.bodySmall)
+            }
+        }
         if (!loading && !connected) {
             Button(onClick = { scope.launch { refresh() } }) {
                 Text("Retry connection")
@@ -181,12 +205,15 @@ private fun WispGateApp(client: RelayClient) {
             state = refreshState,
             modifier = Modifier.fillMaxSize(),
         ) {
-            Column {
+            Column(Modifier.fillMaxSize()) {
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 if (!loading && connected && wisps.isEmpty()) {
                     Text("The relay is reachable, but no Wisps are currently connected.")
                 }
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LazyColumn(
+                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
                     items(wisps) { wisp ->
                         Card(Modifier.fillMaxWidth().clickable {
                             selected = wisp
@@ -201,7 +228,6 @@ private fun WispGateApp(client: RelayClient) {
                         }) {
                             Column(Modifier.padding(16.dp)) {
                                 Text(wisp.name, style = MaterialTheme.typography.titleLarge)
-                                Text(wisp.description)
                             }
                         }
                     }

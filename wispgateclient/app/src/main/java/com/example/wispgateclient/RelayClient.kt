@@ -16,9 +16,16 @@ import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
 
 class RelayClient(private val context: Context) {
-    data class ServerInfo(val host: String, val publicKey: String, val controlPort: Int = 443, val relayPort: Int = 4443)
+    data class ServerInfo(
+        val host: String,
+        val publicKey: String,
+        val controlPort: Int = 443,
+        val relayPort: Int = 4443,
+        val updateToken: String = "",
+    )
     data class Wisp(val id: String, val name: String, val description: String, val owner: String)
     data class WispState(val wispId: String, val html: String)
+
     data class ConnectionResult(val wisps: List<Wisp>, val sessionToken: String)
 
     private val preferences = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
@@ -26,12 +33,19 @@ class RelayClient(private val context: Context) {
     fun savedServer(): ServerInfo? {
         val host = preferences.getString("host", null) ?: return null
         val key = preferences.getString("public_key", null) ?: return null
-        return ServerInfo(host, key, preferences.getInt("control_port", 443), preferences.getInt("relay_port", 4443))
+        return ServerInfo(
+            host,
+            key,
+            preferences.getInt("control_port", 443),
+            preferences.getInt("relay_port", 4443),
+            preferences.getString("update_token", "") ?: "",
+        )
     }
 
     fun saveServer(info: ServerInfo) {
         preferences.edit().putString("host", info.host).putString("public_key", info.publicKey)
-            .putInt("control_port", info.controlPort).putInt("relay_port", info.relayPort).apply()
+            .putInt("control_port", info.controlPort).putInt("relay_port", info.relayPort)
+            .putString("update_token", info.updateToken).apply()
     }
 
     suspend fun connectAndListWisps(info: ServerInfo): ConnectionResult = withContext(Dispatchers.IO) {
@@ -50,6 +64,22 @@ class RelayClient(private val context: Context) {
             val sessionToken = joined.getString("session_token")
             preferences.edit().putString("session_token", sessionToken).apply()
             ConnectionResult(wisps, sessionToken)
+        }
+    }
+
+    suspend fun updateServer(info: ServerInfo): String = withContext(Dispatchers.IO) {
+        require(info.updateToken.isNotBlank()) { "Set the server update token in relay settings first" }
+        Socket(info.host, info.controlPort).use { socket ->
+            socket.soTimeout = 15_000
+            val input = socket.reader()
+            val output = socket.writer()
+            send(output, joinMessage(info, "android-user"))
+            val joined = input.readJson("relay response")
+            if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
+            send(output, JSONObject().put("type", "update_server").put("token", info.updateToken).toString())
+            val result = input.readJson("update response")
+            if (!result.optBoolean("ok")) error(result.optString("error", "Server update rejected"))
+            result.optString("type", "update_started")
         }
     }
 

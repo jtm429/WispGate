@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import secrets
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,8 @@ class RelayRuntime:
     config: RelayConfig
     state: RelayState
     sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
+    update_token: str | None = None
+    update_command: tuple[str, ...] | None = None
 
     async def handle_control(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -50,6 +54,7 @@ class RelayRuntime:
             if registration:
                 message = json.loads(registration)
                 if message.get("type") == "wisps":
+                    self.state.remove_wisps_for_owner(client_id)
                     for item in message.get("items", []):
                         if item.get("id"):
                             self.state.wisps[item["id"]] = {
@@ -60,6 +65,8 @@ class RelayRuntime:
                             }
                     self.state.save()
                     await send_json(writer, {"ok": True, "type": "wisps_registered", "items": list(self.state.wisps.values())})
+                elif message.get("type") == "update_server":
+                    await self.handle_update_request(writer, message)
             LOG.info("client joined: %s from %s", client_id, peer)
         except (KeyError, ValueError, json.JSONDecodeError, base64.binascii.Error, asyncio.TimeoutError) as exc:
             LOG.warning("rejected join from %s: %s", peer, exc)
@@ -67,6 +74,17 @@ class RelayRuntime:
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def handle_update_request(self, writer: asyncio.StreamWriter, message: dict[str, Any]) -> None:
+        supplied = message.get("token", "")
+        if not self.update_token or not hmac.compare_digest(supplied, self.update_token):
+            await send_json(writer, {"ok": False, "error": "update_unauthorized"})
+            return
+        if not self.update_command:
+            await send_json(writer, {"ok": False, "error": "update_unconfigured"})
+            return
+        await send_json(writer, {"ok": True, "type": "update_started"})
+        subprocess.Popen(self.update_command, start_new_session=True)
 
     async def handle_relay(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -102,6 +120,8 @@ class RelayRuntime:
         finally:
             if client_id and self.sessions.get(client_id, (None, None))[1] is writer:
                 self.sessions.pop(client_id, None)
+                self.state.remove_wisps_for_owner(client_id)
+                self.state.save()
             writer.close()
             await writer.wait_closed()
 

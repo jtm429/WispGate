@@ -74,6 +74,16 @@ Selecting a Wisp sends a generic, non-mutating state request:
 
 The Wisp responds with its current complete UI/state. This request must not advance the Wisp's turn or invoke its ordinary action handler. Other UI events are sent as applet-defined actions and may advance the turn.
 
+## Authenticated server update request
+
+The Android host may send the fixed control message below after joining:
+
+```json
+{"type": "update_server", "token": "..."}
+```
+
+The relay compares the token with its root-provisioned update token and, when configured, starts the root-owned fixed update script. The token is never logged, returned, or included in the Git repository. The update script accepts no user-supplied command or path; it fast-forwards the deployment checkout to `origin/main` and restarts the relay service.
+
 ## Relay restart and client resumption
 
 The relay persists client registration records and the information needed to attempt reconnection after an Azure VM restart. On startup it loads that state and tries to re-establish sessions with clients previously connected to the deployment.

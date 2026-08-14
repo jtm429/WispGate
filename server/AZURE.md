@@ -65,7 +65,28 @@ View logs:
 sudo journalctl -u wispgate-relay -f
 ```
 
-## 6. Verify readiness
+## 6. Install the one-time app update hook
+
+The Android update button does not execute arbitrary commands. It sends a fixed authenticated update request; the VM runs the checked-in update script, which fast-forwards `/opt/wispgate` and restarts this service.
+
+Run this once on the VM after pulling the updated repository:
+
+```bash
+sudo install -o root -g root -m 0755 /opt/wispgate/server/update-wispgate.sh /usr/local/sbin/wispgate-update
+sudo install -o root -g root -m 0440 /opt/wispgate/server/wispgate-update.sudoers /etc/sudoers.d/wispgate-update
+sudo visudo -cf /etc/sudoers.d/wispgate-update
+openssl rand -hex 32 | sudo tee /var/lib/wispgate/update-token >/dev/null
+sudo chown root:wisp /var/lib/wispgate/update-token
+sudo chmod 0640 /var/lib/wispgate/update-token
+sudo cp /opt/wispgate/server/wispgate-relay.service /etc/systemd/system/wispgate-relay.service
+sudo systemctl daemon-reload
+sudo systemctl enable wispgate-relay
+sudo systemctl restart wispgate-relay
+```
+
+Enter the generated token into the Android app's `Server update token` setting. Do not send the token in chat or commit it. After this one-time setup, the app's `Update server` button can perform future fast-forward updates without SSH.
+
+## 7. Verify readiness
 
 From the VM:
 
@@ -76,7 +97,7 @@ sudo systemctl is-active wispgate-relay
 
 The service is ready when both ports are listening and `systemctl is-active` prints `active`.
 
-## 7. Stopping and starting to save money
+## 8. Stopping and starting to save money
 
 Stop the relay cleanly before deallocating the VM:
 

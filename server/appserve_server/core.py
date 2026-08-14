@@ -122,3 +122,10 @@ class RelayState:
     def drain(self, client_id: str) -> list[dict[str, Any]]:
         result = self.queues.pop(client_id, [])
         return result
+
+    def remove_wisps_for_owner(self, owner: str) -> None:
+        self.wisps = {
+            wisp_id: manifest
+            for wisp_id, manifest in self.wisps.items()
+            if manifest.get("owner") != owner
+        }

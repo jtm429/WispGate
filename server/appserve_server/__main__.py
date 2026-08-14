@@ -21,6 +21,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--relay-host", default="0.0.0.0")
     result.add_argument("--relay-port", type=int, default=4443)
     result.add_argument("--log-level", default="INFO")
+    result.add_argument("--update-token-file", type=Path)
+    result.add_argument("--update-command", nargs="+")
     return result
 
 
@@ -30,7 +32,16 @@ def main() -> None:
     key = args.private_key.read_bytes()
     state = RelayState(args.state)
     state.load()
-    runtime = RelayRuntime(RelayConfig(key, deployment_id=args.deployment_id), state)
+    update_token = None
+    if args.update_token_file:
+        update_token = args.update_token_file.read_text(encoding="utf-8").strip()
+    update_command = tuple(args.update_command) if args.update_command else None
+    runtime = RelayRuntime(
+        RelayConfig(key, deployment_id=args.deployment_id),
+        state,
+        update_token=update_token,
+        update_command=update_command,
+    )
     asyncio.run(serve(runtime, args.control_host, args.control_port, args.relay_host, args.relay_port))
 
 
