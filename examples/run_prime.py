@@ -28,7 +28,10 @@ def main() -> None:
     """Load serverinfo.txt, register the Prime Wisp, and serve it."""
     runtime = appserve.load(find_serverinfo())
     runtime.register(PrimeWisp().as_wisp())
-    asyncio.run(runtime.serve())
+    try:
+        asyncio.run(runtime.serve())
+    except KeyboardInterrupt:
+        print("Prime Wisp stopped.")
 
 
 if __name__ == "__main__":

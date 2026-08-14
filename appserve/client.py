@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -11,6 +12,9 @@ from typing import Any, Awaitable, Callable
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -47,24 +51,63 @@ class AppserveClient:
         self._wisps[wisp.id] = wisp
 
     async def serve(self) -> None:
+        delay = 1.0
+        try:
+            while True:
+                try:
+                    await self._serve_once()
+                    delay = 1.0
+                    raise ConnectionError("relay connection closed")
+                except asyncio.CancelledError:
+                    raise
+                except (ConnectionError, OSError, asyncio.IncompleteReadError, json.JSONDecodeError) as cause:
+                    self._close_connection()
+                    LOG.warning("relay connection lost: %s; reconnecting in %.1fs", cause, delay)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 30.0)
+        finally:
+            await self.close()
+
+    async def _serve_once(self) -> None:
         reader, writer = await asyncio.open_connection(self.info.host, self.info.control_port)
         self._reader, self._writer = reader, writer
-        bootstrap = self._bootstrap_payload()
-        await self._send(writer, {"type": "join", "payload": bootstrap})
-        joined = await self._read(reader)
-        if not joined.get("ok"):
-            raise RuntimeError(joined.get("error", "join failed"))
-        self._session_token = joined["session_token"]
-        await self._send(writer, {"type": "wisps", "items": [w.manifest() for w in self._wisps.values()]})
-        writer.close()
-        await writer.wait_closed()
+        try:
+            bootstrap = self._bootstrap_payload()
+            await self._send(writer, {"type": "join", "payload": bootstrap})
+            joined = await self._read(reader)
+            if not joined.get("ok"):
+                raise ConnectionError(joined.get("error", "join failed"))
+            self._session_token = joined["session_token"]
+            await self._send(writer, {"type": "wisps", "items": [w.manifest() for w in self._wisps.values()]})
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            self._reader = self._writer = None
 
-        self._reader, self._writer = await asyncio.open_connection(self.info.host, self.info.relay_port)
-        await self._send(self._writer, {"type": "session", "session_token": self._session_token})
-        ready = await self._read(self._reader)
+        reader, writer = await asyncio.open_connection(self.info.host, self.info.relay_port)
+        self._reader, self._writer = reader, writer
+        await self._send(writer, {"type": "session", "session_token": self._session_token})
+        ready = await self._read(reader)
         if not ready.get("ok"):
-            raise RuntimeError(ready.get("error", "session failed"))
+            raise ConnectionError(ready.get("error", "session failed"))
         await self._event_loop()
+
+    async def close(self) -> None:
+        writer = self._writer
+        self._reader = self._writer = None
+        self._session_token = None
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    def _close_connection(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+        self._reader = self._writer = None
+        self._session_token = None
 
     async def _event_loop(self) -> None:
         assert self._reader is not None
