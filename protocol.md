@@ -128,6 +128,18 @@ The design protects application contents from:
 
 It does not hide metadata such as connection timing, message sizes, routing IDs, or online status from the relay. It does not protect a client whose private keys or runtime are already compromised.
 
+## Host-provided Wisp theme
+
+The Android host injects its device-matched Wisp CSS into Wisp HTML before rendering. The host applies the current light/dark system mode and keeps the CSS locally on the device; it does not request a stylesheet over the relay.
+
+A Wisp that wants to own its complete visual theme can opt out by including this metadata in its document:
+
+```html
+<meta name="wispgate-theme" content="custom">
+```
+
+The host then renders the Wisp HTML unchanged. The marker is a presentation preference only; it does not affect Wisp state, actions, or transport.
+
 ## Webapp boundary
 
 The webapp is an interface authored by the user, not an untrusted public marketplace item. It still uses the host bridge instead of receiving raw private keys. The native host performs cryptographic operations and exposes only the applet messaging/storage operations needed by that applet.

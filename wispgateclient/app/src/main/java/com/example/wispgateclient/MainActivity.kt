@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -39,6 +40,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.wispgateclient.ui.theme.WispGateClientTheme
@@ -269,6 +271,11 @@ private fun SetupScreen(onSave: (String, String, String, String) -> Unit) {
 
 @Composable
 private fun WebAppScreen(wisp: RelayClient.Wisp, html: String, onAction: (String) -> Unit, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val darkTheme = isSystemInDarkTheme()
+    val themedHtml = remember(html, darkTheme) {
+        WispHtmlTheme.apply(context, html, darkTheme)
+    }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Button(onClick = onBack) { Text("Back") }
@@ -285,7 +292,7 @@ private fun WebAppScreen(wisp: RelayClient.Wisp, html: String, onAction: (String
                     }, "WispGate")
                 }
             },
-            update = { view -> view.loadDataWithBaseURL("https://wisp.local/", html, "text/html", "UTF-8", null) },
+            update = { view -> view.loadDataWithBaseURL("https://wisp.local/", themedHtml, "text/html", "UTF-8", null) },
         )
     }
 }
