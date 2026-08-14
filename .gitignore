@@ -11,3 +11,4 @@ state/
 .cache/
 .DS_Store
 Thumbs.db
+serverinfo.txt
