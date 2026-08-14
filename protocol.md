@@ -87,10 +87,10 @@ The host replaces its contacts from this message; it does not poll the relay for
 The Android host may send the fixed control message below after joining:
 
 ```json
-{"type": "update_server", "token": "..."}
+{"type": "update_server"}
 ```
 
-The relay compares the token with its root-provisioned update token and, when configured, starts the root-owned fixed update script. The token is never logged, returned, or included in the Git repository. The update script accepts no user-supplied command or path; it fast-forwards the deployment checkout to `origin/main` and restarts the relay service.
+The request is accepted only after the Android client has completed the relay's authenticated join. The relay then starts the root-owned fixed update script. The update script accepts no user-supplied command or path; it fast-forwards the deployment checkout to `origin/main` and restarts the relay service. GitHub access remains separately restricted to the operator's VM credentials.
 
 ## Relay restart and client resumption
 

@@ -67,7 +67,7 @@ sudo journalctl -u wispgate-relay -f
 
 ## 6. Install the one-time app update hook
 
-The Android update button does not execute arbitrary commands. It sends a fixed authenticated update request; the VM runs the checked-in update script, which fast-forwards `/opt/wispgate` and restarts this service.
+The Android update button does not execute arbitrary commands. It sends a fixed update request after the Android client completes the relay join; the VM runs the checked-in update script, which fast-forwards `/opt/wispgate` and restarts this service. GitHub access remains restricted to the operator's VM credentials.
 
 Run this once on the VM after pulling the updated repository:
 
@@ -75,16 +75,13 @@ Run this once on the VM after pulling the updated repository:
 sudo install -o root -g root -m 0755 /opt/wispgate/server/update-wispgate.sh /usr/local/sbin/wispgate-update
 sudo install -o root -g root -m 0440 /opt/wispgate/server/wispgate-update.sudoers /etc/sudoers.d/wispgate-update
 sudo visudo -cf /etc/sudoers.d/wispgate-update
-openssl rand -hex 32 | sudo tee /var/lib/wispgate/update-token >/dev/null
-sudo chown root:wisp /var/lib/wispgate/update-token
-sudo chmod 0640 /var/lib/wispgate/update-token
 sudo cp /opt/wispgate/server/wispgate-relay.service /etc/systemd/system/wispgate-relay.service
 sudo systemctl daemon-reload
 sudo systemctl enable wispgate-relay
 sudo systemctl restart wispgate-relay
 ```
 
-Enter the generated token into the Android app's `Server update token` setting. Do not send the token in chat or commit it. After this one-time setup, the app's `Update server` button can perform future fast-forward updates without SSH.
+After this one-time setup, the app's `Update server from GitHub` button can perform future fast-forward updates without SSH. No update token needs to be generated or copied into the app.
 
 ## 7. Verify readiness
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hmac
 import json
 import logging
 import secrets
@@ -22,7 +21,6 @@ class RelayRuntime:
     state: RelayState
     sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
     control_sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
-    update_token: str | None = None
     update_command: tuple[str, ...] | None = None
 
     async def handle_control(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -72,7 +70,7 @@ class RelayRuntime:
                         while await reader.readline():
                             pass
                 elif message.get("type") == "update_server":
-                    await self.handle_update_request(writer, message)
+                    await self.handle_update_request(writer, client_id)
             LOG.info("client joined: %s from %s", client_id, peer)
         except (KeyError, ValueError, json.JSONDecodeError, base64.binascii.Error, asyncio.TimeoutError) as exc:
             LOG.warning("rejected join from %s: %s", peer, exc)
@@ -94,9 +92,8 @@ class RelayRuntime:
         for client_id in stale:
             self.control_sessions.pop(client_id, None)
 
-    async def handle_update_request(self, writer: asyncio.StreamWriter, message: dict[str, Any]) -> None:
-        supplied = message.get("token", "")
-        if not self.update_token or not hmac.compare_digest(supplied, self.update_token):
+    async def handle_update_request(self, writer: asyncio.StreamWriter, client_id: str) -> None:
+        if client_id != "android-user":
             await send_json(writer, {"ok": False, "error": "update_unauthorized"})
             return
         if not self.update_command:
