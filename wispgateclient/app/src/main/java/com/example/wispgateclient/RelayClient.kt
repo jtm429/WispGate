@@ -43,22 +43,27 @@ class RelayClient(private val context: Context) {
             send(output, joinMessage(info, clientId))
             val joined = JSONObject(input.readLine())
             if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
-            val wisps = mutableListOf<Wisp>()
-            val items = joined.optJSONArray("wisps") ?: JSONArray()
-            for (index in 0 until items.length()) {
-                val item = items.getJSONObject(index)
-                wisps += Wisp(
+            send(output, JSONObject().put("type", "wisps").put("items", JSONArray()).toString())
+            val registration = JSONObject(input.readLine())
+            if (!registration.optBoolean("ok")) error(registration.optString("error", "Wisp catalog registration failed"))
+            val wisps = parseWisps(registration.optJSONArray("items") ?: JSONArray())
+            val sessionToken = joined.getString("session_token")
+            preferences.edit().putString("session_token", sessionToken).apply()
+            ConnectionResult(wisps, sessionToken)
+        }
+    }
+
+    private fun parseWisps(items: JSONArray): List<Wisp> = buildList {
+        for (index in 0 until items.length()) {
+            val item = items.getJSONObject(index)
+            add(
+                Wisp(
                     item.getString("id"),
                     item.optString("name", item.getString("id")),
                     item.optString("description"),
                     item.optString("owner"),
-                )
-            }
-            send(output, JSONObject().put("type", "wisps").put("items", JSONArray()).toString())
-            input.readLine()
-            val sessionToken = joined.getString("session_token")
-            preferences.edit().putString("session_token", sessionToken).apply()
-            ConnectionResult(wisps, sessionToken)
+                ),
+            )
         }
     }
 
