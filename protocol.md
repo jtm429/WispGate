@@ -74,6 +74,14 @@ Selecting a Wisp sends a generic, non-mutating state request:
 
 The Wisp responds with its current complete UI/state. This request must not advance the Wisp's turn or invoke its ordinary action handler. Other UI events are sent as applet-defined actions and may advance the turn.
 
+An Android host keeps its control connection open after catalog registration. When a Wisp registers or disconnects, the relay pushes:
+
+```json
+{"ok":true,"type":"catalog_update","items":[...]}
+```
+
+The host replaces its contacts from this message; it does not poll the relay for catalog changes. If an interactive request targets a Wisp with no active relay session, the relay returns `recipient_offline` immediately rather than acknowledging a request that cannot produce a response.
+
 ## Authenticated server update request
 
 The Android host may send the fixed control message below after joining:

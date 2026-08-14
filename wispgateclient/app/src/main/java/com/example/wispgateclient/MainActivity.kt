@@ -43,7 +43,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.wispgateclient.ui.theme.WispGateClientTheme
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.coroutineScope
+
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,6 +77,7 @@ private fun WispGateApp(client: RelayClient) {
     var updatingServer by remember { mutableStateOf(false) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
 
+
     if (server == null) {
         SetupScreen(
             onSave = { host, key, controlPort, relayPort ->
@@ -90,6 +92,22 @@ private fun WispGateApp(client: RelayClient) {
     if (settingsOpen) {
         SettingsScreen(
             initial = server!!,
+            onUpdate = {
+                scope.launch {
+                    updatingServer = true
+                    updateMessage = null
+                    try {
+                        client.updateServer(server!!)
+                        updateMessage = "Server update started."
+                    } catch (cause: Throwable) {
+                        updateMessage = cause.message ?: "Unable to start server update"
+                    } finally {
+                        updatingServer = false
+                    }
+                }
+            },
+            updating = updatingServer,
+            updateMessage = updateMessage,
             onSave = { info ->
                 client.saveServer(info)
                 server = info
@@ -137,9 +155,15 @@ private fun WispGateApp(client: RelayClient) {
     }
 
     LaunchedEffect(server) {
-        while (true) {
+        coroutineScope {
+            launch {
+                client.catalogUpdates.collect { catalog ->
+                    wisps = catalog
+                    connected = true
+                    error = null
+                }
+            }
             refresh()
-            delay(5_000)
         }
     }
 
@@ -171,28 +195,7 @@ private fun WispGateApp(client: RelayClient) {
             color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
             style = MaterialTheme.typography.bodyMedium,
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(
-                enabled = !updatingServer && server!!.updateToken.isNotBlank(),
-                onClick = {
-                    scope.launch {
-                        updatingServer = true
-                        updateMessage = null
-                        try {
-                            client.updateServer(server!!)
-                            updateMessage = "Server update started."
-                        } catch (cause: Throwable) {
-                            updateMessage = cause.message ?: "Unable to start server update"
-                        } finally {
-                            updatingServer = false
-                        }
-                    }
-                },
-            ) { Text(if (updatingServer) "Updating…" else "Update server") }
-            if (updateMessage != null) {
-                Text(updateMessage!!, style = MaterialTheme.typography.bodySmall)
-            }
-        }
+
         if (!loading && !connected) {
             Button(onClick = { scope.launch { refresh() } }) {
                 Text("Retry connection")

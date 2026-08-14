@@ -21,6 +21,7 @@ class RelayRuntime:
     config: RelayConfig
     state: RelayState
     sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
+    control_sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
     update_token: str | None = None
     update_command: tuple[str, ...] | None = None
 
@@ -65,6 +66,11 @@ class RelayRuntime:
                             }
                     self.state.save()
                     await send_json(writer, {"ok": True, "type": "wisps_registered", "items": list(self.state.wisps.values())})
+                    await self.broadcast_catalog()
+                    if client_id == "android-user":
+                        self.control_sessions[client_id] = (token, writer)
+                        while await reader.readline():
+                            pass
                 elif message.get("type") == "update_server":
                     await self.handle_update_request(writer, message)
             LOG.info("client joined: %s from %s", client_id, peer)
@@ -72,8 +78,21 @@ class RelayRuntime:
             LOG.warning("rejected join from %s: %s", peer, exc)
             await send_json(writer, {"ok": False, "error": "invalid_bootstrap"})
         finally:
+            if client_id and self.control_sessions.get(client_id, (None, None))[1] is writer:
+                self.control_sessions.pop(client_id, None)
             writer.close()
             await writer.wait_closed()
+
+    async def broadcast_catalog(self) -> None:
+        message = {"ok": True, "type": "catalog_update", "items": list(self.state.wisps.values())}
+        stale: list[str] = []
+        for client_id, (_, writer) in list(self.control_sessions.items()):
+            try:
+                await send_json(writer, message)
+            except (ConnectionError, OSError):
+                stale.append(client_id)
+        for client_id in stale:
+            self.control_sessions.pop(client_id, None)
 
     async def handle_update_request(self, writer: asyncio.StreamWriter, message: dict[str, Any]) -> None:
         supplied = message.get("token", "")
@@ -122,6 +141,7 @@ class RelayRuntime:
                 self.sessions.pop(client_id, None)
                 self.state.remove_wisps_for_owner(client_id)
                 self.state.save()
+                await self.broadcast_catalog()
             writer.close()
             await writer.wait_closed()
 
@@ -136,6 +156,12 @@ class RelayRuntime:
         if destination:
             await send_json(destination[1], envelope)
         else:
+            body = envelope.get("body", {})
+            if body.get("action") in {"state_request", "user_action"}:
+                source = self.sessions.get(sender)
+                if source:
+                    await send_json(source[1], {"ok": False, "error": "recipient_offline"})
+                return
             self.state.queue(recipient, envelope)
             self.state.save()
         source = self.sessions.get(sender)

@@ -3,7 +3,13 @@ package com.example.wispgateclient
 import android.content.Context
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -29,6 +35,11 @@ class RelayClient(private val context: Context) {
     data class ConnectionResult(val wisps: List<Wisp>, val sessionToken: String)
 
     private val preferences = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
+    private val controlScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var controlSocket: Socket? = null
+    private var controlJob: Job? = null
+    private val _catalogUpdates = MutableSharedFlow<List<Wisp>>(replay = 1, extraBufferCapacity = 1)
+    val catalogUpdates = _catalogUpdates.asSharedFlow()
 
     fun savedServer(): ServerInfo? {
         val host = preferences.getString("host", null) ?: return null
@@ -50,7 +61,9 @@ class RelayClient(private val context: Context) {
 
     suspend fun connectAndListWisps(info: ServerInfo): ConnectionResult = withContext(Dispatchers.IO) {
         val clientId = "android-user"
-        Socket(info.host, info.controlPort).use { socket ->
+        closeControlConnection()
+        val socket = Socket(info.host, info.controlPort)
+        try {
             socket.soTimeout = 10_000
             val input = socket.reader()
             val output = socket.writer()
@@ -63,8 +76,32 @@ class RelayClient(private val context: Context) {
             val wisps = parseWisps(registration.optJSONArray("items") ?: JSONArray())
             val sessionToken = joined.getString("session_token")
             preferences.edit().putString("session_token", sessionToken).apply()
+            socket.soTimeout = 0
+            controlSocket = socket
+            controlJob = controlScope.launch {
+                try {
+                    while (true) {
+                        val update = input.readJson("catalog update")
+                        if (update.optString("type") == "catalog_update") {
+                            _catalogUpdates.emit(parseWisps(update.optJSONArray("items") ?: JSONArray()))
+                        }
+                    }
+                } catch (_: Throwable) {
+                    // The next explicit reconnect reports the actionable error.
+                }
+            }
             ConnectionResult(wisps, sessionToken)
+        } catch (cause: Throwable) {
+            socket.close()
+            throw cause
         }
+    }
+
+    fun closeControlConnection() {
+        controlJob?.cancel()
+        controlJob = null
+        controlSocket?.close()
+        controlSocket = null
     }
 
     suspend fun updateServer(info: ServerInfo): String = withContext(Dispatchers.IO) {
