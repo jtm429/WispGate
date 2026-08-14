@@ -67,7 +67,7 @@ sudo journalctl -u wispgate-relay -f
 
 ## 6. Install the one-time app update hook
 
-The Android update button does not execute arbitrary commands. It sends a fixed update request after the Android client completes the relay join; the VM runs the checked-in update script, which fast-forwards `/opt/wispgate` and restarts this service. GitHub access remains restricted to the operator's VM credentials.
+The Android update button does not execute arbitrary commands. It sends a fixed update request after the Android client completes the relay join; the VM invokes the configured fixed update script, which fast-forwards `/opt/wispgate` and restarts this service. GitHub access remains restricted to the operator's VM credentials.
 
 Run this once on the VM after pulling the updated repository:
 

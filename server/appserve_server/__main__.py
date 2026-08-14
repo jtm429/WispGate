@@ -21,7 +21,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--relay-host", default="0.0.0.0")
     result.add_argument("--relay-port", type=int, default=4443)
     result.add_argument("--log-level", default="INFO")
-    result.add_argument("--update-command", nargs="+")
+    result.add_argument("--update-script", type=Path)
     return result
 
 
@@ -31,7 +31,7 @@ def main() -> None:
     key = args.private_key.read_bytes()
     state = RelayState(args.state)
     state.load()
-    update_command = tuple(args.update_command) if args.update_command else None
+    update_command = ("/usr/bin/sudo", "-n", str(args.update_script)) if args.update_script else None
     runtime = RelayRuntime(
         RelayConfig(key, deployment_id=args.deployment_id),
         state,
