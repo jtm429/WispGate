@@ -115,14 +115,32 @@ object E2EEnvelope {
             )
         }
 
-    private fun signature(key: PrivateKey): Signature = Signature.getInstance("RSASSA-PSS").apply {
-        initSign(key)
-        setParameter(PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1))
+    fun selectPssAlgorithm(available: (String) -> Boolean): String =
+        listOf("SHA256withRSA/PSS", "RSASSA-PSS").firstOrNull(available)
+            ?: throw java.security.NoSuchAlgorithmException("RSA-PSS SHA-256 is not available")
+
+    private fun pssAlgorithm(): String = selectPssAlgorithm { name ->
+        runCatching { Signature.getInstance(name) }.isSuccess
     }
 
-    private fun signature(key: PublicKey): Signature = Signature.getInstance("RSASSA-PSS").apply {
-        initVerify(key)
-        setParameter(PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1))
+    private fun signature(key: PrivateKey): Signature {
+        val algorithm = pssAlgorithm()
+        return Signature.getInstance(algorithm).apply {
+            initSign(key)
+            if (algorithm == "RSASSA-PSS") {
+                setParameter(PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1))
+            }
+        }
+    }
+
+    private fun signature(key: PublicKey): Signature {
+        val algorithm = pssAlgorithm()
+        return Signature.getInstance(algorithm).apply {
+            initVerify(key)
+            if (algorithm == "RSASSA-PSS") {
+                setParameter(PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1))
+            }
+        }
     }
 
     private fun encode64(data: ByteArray): String {

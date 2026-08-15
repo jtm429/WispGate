@@ -14,6 +14,18 @@ class E2EEnvelopeTest {
     private fun identity() = KeyPairGenerator.getInstance("RSA").apply { initialize(3072) }.generateKeyPair()
 
     @Test
+    fun selectsAndroidPssNameBeforeDesktopJvmFallback() {
+        assertEquals(
+            "SHA256withRSA/PSS",
+            E2EEnvelope.selectPssAlgorithm { it == "SHA256withRSA/PSS" || it == "RSASSA-PSS" },
+        )
+        assertEquals(
+            "RSASSA-PSS",
+            E2EEnvelope.selectPssAlgorithm { it == "RSASSA-PSS" },
+        )
+    }
+
+    @Test
     fun encryptsApplicationBodyAndAuthenticatesSender() {
         val android = identity()
         val wisp = identity()
