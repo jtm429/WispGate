@@ -1,10 +1,16 @@
 package com.example.wispgateclient
 
+import android.content.ActivityNotFoundException
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
-import android.webkit.WebView
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
@@ -33,6 +39,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -275,6 +282,13 @@ private fun SetupScreen(onSave: (String, String, String, String) -> Unit) {
 private fun WebAppScreen(wisp: RelayClient.Wisp, html: String, onAction: (String) -> Unit, onBack: () -> Unit) {
     val context = LocalContext.current
     val darkTheme = isSystemInDarkTheme()
+    val pendingFileChooser = remember { PendingFileChooser<Array<Uri>>() }
+    val fileChooserLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        pendingFileChooser.complete(WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data))
+    }
+    DisposableEffect(Unit) {
+        onDispose { pendingFileChooser.cancel() }
+    }
     val themedHtml = remember(html, darkTheme) {
         WispHtmlTheme.apply(context, html, darkTheme)
     }
@@ -288,6 +302,25 @@ private fun WebAppScreen(wisp: RelayClient.Wisp, html: String, onAction: (String
             factory = { context ->
                 WebView(context).apply {
                     settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    webViewClient = WebViewClient()
+                    webChromeClient = object : WebChromeClient() {
+                        override fun onShowFileChooser(
+                            webView: WebView?,
+                            filePathCallback: android.webkit.ValueCallback<Array<Uri>>?,
+                            fileChooserParams: FileChooserParams?,
+                        ): Boolean {
+                            if (filePathCallback == null || fileChooserParams == null) return false
+                            pendingFileChooser.replace(filePathCallback::onReceiveValue)
+                            return try {
+                                fileChooserLauncher.launch(fileChooserParams.createIntent())
+                                true
+                            } catch (_: ActivityNotFoundException) {
+                                pendingFileChooser.cancel()
+                                false
+                            }
+                        }
+                    }
                     addJavascriptInterface(object {
                         @JavascriptInterface
                         fun submit(action: String) = onAction(action)
