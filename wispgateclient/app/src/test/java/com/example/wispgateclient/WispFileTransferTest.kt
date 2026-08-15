@@ -70,6 +70,32 @@ class WispFileTransferTest {
     }
 
     @Test
+    fun nativeStagingChunksCanBeLargerThanRelayChunks() {
+        val root = Files.createTempDirectory("wisp-stager-test").toFile()
+        val completed = mutableListOf<StagedFileAction>()
+        val stager = FileTransferStager(root, completed::add)
+        val bytes = ByteArray(32 * 1024) { (it % 251).toByte() }
+        val manifest = JSONArray().put(
+            JSONObject().put("id", "f").put("field", "file").put("name", "x.bin")
+                .put("content_type", "application/octet-stream").put("size", bytes.size),
+        )
+        val transferId = stager.begin("{}", manifest.toString())
+
+        val received = stager.append(
+            transferId,
+            "f",
+            0,
+            java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes),
+        )
+        stager.finish(transferId)
+
+        assertEquals(bytes.size.toLong(), received)
+        assertTrue(completed.single().files.single().path.readBytes().contentEquals(bytes))
+        completed.single().cleanup()
+        root.deleteRecursively()
+    }
+
+    @Test
     fun boundsConcurrentStagedTransfers() {
         val root = Files.createTempDirectory("wisp-stager-test").toFile()
         val stager = FileTransferStager(root) { }

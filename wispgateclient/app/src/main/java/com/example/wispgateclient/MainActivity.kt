@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebChromeClient
@@ -147,10 +148,13 @@ private fun WispGateApp(client: RelayClient) {
                 }
             },
             onFileAction = { action ->
+                Log.i("WispFileTransfer", "native upload queued transfer=${action.transferId} files=${action.files.size}")
                 val upload = scope.launch {
                     try {
                         html = client.sendFileAction(server!!, selected!!, action).html
+                        Log.i("WispFileTransfer", "native upload completed transfer=${action.transferId}")
                     } catch (cause: Throwable) {
+                        Log.e("WispFileTransfer", "native upload failed transfer=${action.transferId}", cause)
                         error = cause.message ?: "Unable to send Wisp file action"
                     }
                 }
@@ -339,6 +343,14 @@ private fun WebAppScreen(
                         }
                     }
                     webChromeClient = object : WebChromeClient() {
+                        override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+                            Log.w(
+                                "WispWebView",
+                                "${consoleMessage.messageLevel()} ${consoleMessage.message()} @${consoleMessage.lineNumber()}",
+                            )
+                            return true
+                        }
+
                         override fun onShowFileChooser(
                             webView: WebView?,
                             filePathCallback: android.webkit.ValueCallback<Array<Uri>>?,
@@ -360,18 +372,28 @@ private fun WebAppScreen(
                         fun submit(action: String) = onAction(action)
 
                         @JavascriptInterface
-                        fun beginFileAction(action: String, manifest: String): String =
-                            fileTransferStager.begin(action, manifest)
+                        fun beginFileAction(action: String, manifest: String): String {
+                            Log.i("WispFileTransfer", "bridge begin requested")
+                            return fileTransferStager.begin(action, manifest).also {
+                                Log.i("WispFileTransfer", "bridge staged transfer=$it")
+                            }
+                        }
 
                         @JavascriptInterface
                         fun appendFileChunk(transferId: String, fileId: String, offset: Long, data: String): Long =
                             fileTransferStager.append(transferId, fileId, offset, data)
 
                         @JavascriptInterface
-                        fun finishFileAction(transferId: String) = fileTransferStager.finish(transferId)
+                        fun finishFileAction(transferId: String) {
+                            Log.i("WispFileTransfer", "bridge finish transfer=$transferId")
+                            fileTransferStager.finish(transferId)
+                        }
 
                         @JavascriptInterface
-                        fun cancelFileAction(transferId: String) = fileTransferStager.cancel(transferId)
+                        fun cancelFileAction(transferId: String) {
+                            Log.w("WispFileTransfer", "bridge cancel transfer=$transferId")
+                            fileTransferStager.cancel(transferId)
+                        }
                     }, "_WispGateNative")
                 }
             },

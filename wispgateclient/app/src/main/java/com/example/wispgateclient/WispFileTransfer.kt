@@ -2,9 +2,9 @@ package com.example.wispgateclient
 
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -22,38 +22,12 @@ internal object StagedFileCache {
 }
 
 private object Base64Url {
-    private const val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    fun encode(data: ByteArray): String = Base64.getUrlEncoder().withoutPadding().encodeToString(data)
 
-    fun encode(data: ByteArray): String {
-        val output = StringBuilder((data.size * 4 + 2) / 3)
-        var index = 0
-        while (index < data.size) {
-            val first = data[index++].toInt() and 255
-            val second = if (index < data.size) data[index++].toInt() and 255 else -1
-            val third = if (index < data.size) data[index++].toInt() and 255 else -1
-            output.append(alphabet[first ushr 2])
-            output.append(alphabet[((first and 3) shl 4) or if (second >= 0) second ushr 4 else 0])
-            if (second >= 0) output.append(alphabet[((second and 15) shl 2) or if (third >= 0) third ushr 6 else 0])
-            if (third >= 0) output.append(alphabet[third and 63])
-        }
-        return output.toString()
-    }
-
-    fun decode(value: String): ByteArray {
-        val output = ByteArrayOutputStream(value.length * 3 / 4)
-        var buffer = 0
-        var bits = 0
-        for (character in value) {
-            val decoded = alphabet.indexOf(character)
-            require(decoded >= 0) { "Invalid base64url file chunk" }
-            buffer = (buffer shl 6) or decoded
-            bits += 6
-            if (bits >= 8) {
-                bits -= 8
-                output.write((buffer ushr bits) and 255)
-            }
-        }
-        return output.toByteArray()
+    fun decode(value: String): ByteArray = try {
+        Base64.getUrlDecoder().decode(value)
+    } catch (cause: IllegalArgumentException) {
+        throw IllegalArgumentException("Invalid base64url file chunk", cause)
     }
 }
 
@@ -87,6 +61,7 @@ class FileTransferStager(
         const val MAX_ACTIVE_TRANSFERS = 4
         const val MAX_TOTAL_BYTES = 256L * 1024 * 1024
         const val MAX_CHUNK_BYTES = 24 * 1024
+        const val MAX_STAGING_CHUNK_BYTES = 256 * 1024
     }
 
     private val transfers = mutableMapOf<String, StagedFileAction>()
@@ -138,7 +113,9 @@ class FileTransferStager(
         val file = action.files.firstOrNull { it.id == fileId } ?: throw IllegalArgumentException("Unknown file in transfer")
         require(offset == file.received) { "Unexpected file offset; expected ${file.received}" }
         val chunk = Base64Url.decode(encoded)
-        require(chunk.size <= MAX_CHUNK_BYTES && file.received + chunk.size <= file.size) { "File chunk exceeds the declared size" }
+        require(chunk.size <= MAX_STAGING_CHUNK_BYTES && file.received + chunk.size <= file.size) {
+            "File chunk exceeds the declared size"
+        }
         RandomAccessFile(file.path, "rw").use { output ->
             output.seek(file.received)
             output.write(chunk)
@@ -252,7 +229,7 @@ object WispHtmlRuntime {
       }));
       const transferId = native.beginFileAction(JSON.stringify(values), JSON.stringify(manifest));
       try {
-        const chunkSize = 24 * 1024;
+        const chunkSize = 256 * 1024;
         let sent = 0;
         const total = files.reduce((sum, item) => sum + item.file.size, 0);
         for (const {id, file} of files) {

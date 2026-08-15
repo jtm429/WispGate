@@ -2,6 +2,7 @@ package com.example.wispgateclient
 
 import android.content.Context
 import android.util.Base64
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -200,6 +201,7 @@ class RelayClient(private val context: Context) {
 
     suspend fun sendFileAction(info: ServerInfo, wisp: Wisp, action: StagedFileAction): WispState = interactiveMutex.withLock {
         withContext(Dispatchers.IO) {
+        Log.i("WispFileTransfer", "sending begin transfer=${action.transferId} files=${action.files.size}")
         val token = preferences.getString("session_token", null) ?: error("Connect before sending an action")
         Socket(info.host, info.relayPort).use { socket ->
             socket.soTimeout = 30_000
@@ -225,8 +227,10 @@ class RelayClient(private val context: Context) {
             }
             val chunkSize = transferReady.optInt("chunk_size", FileTransferStager.MAX_CHUNK_BYTES)
             require(chunkSize in 1..FileTransferStager.MAX_CHUNK_BYTES) { "Wisp requested an invalid file chunk size" }
+            Log.i("WispFileTransfer", "Wisp ready transfer=${action.transferId} chunkSize=$chunkSize")
 
             action.files.forEach { file ->
+                Log.i("WispFileTransfer", "sending staged file id=${file.id} bytes=${file.size}")
                 file.path.inputStream().use { source ->
                     val buffer = ByteArray(chunkSize)
                     var offset = 0L
@@ -246,13 +250,16 @@ class RelayClient(private val context: Context) {
                         offset = nextOffset
                     }
                     require(offset == file.size) { "Staged file length changed before upload" }
+                    Log.i("WispFileTransfer", "staged file accepted id=${file.id} bytes=$offset")
                 }
             }
 
+            Log.i("WispFileTransfer", "sending commit transfer=${action.transferId}")
             val completed = exchange(FileActionProtocol.commit(wisp.id, action.transferId))
             completed.optJSONObject("transfer")?.let { transfer ->
                 if (transfer.optString("type") == "error") error(transfer.optString("error", "File action failed"))
             }
+            Log.i("WispFileTransfer", "commit accepted transfer=${action.transferId}")
             WispState(wisp.id, completed.optJSONObject("response")?.optString("html", "") ?: "")
         }
         }
