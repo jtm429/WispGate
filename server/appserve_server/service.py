@@ -43,6 +43,7 @@ class RelayRuntime:
     MAX_PENDING_BULK = 128
     BULK_TICKET_TTL_SECONDS = 10 * 60
     BULK_IO_TIMEOUT_SECONDS = 10 * 60
+    RELAY_LINE_LIMIT_BYTES = 1024 * 1024 + 16 * 1024
 
     def catalog_items(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -362,7 +363,12 @@ async def serve(
     bulk_port: int = 4444,
 ) -> None:
     control = await asyncio.start_server(runtime.handle_control, control_host, control_port)
-    relay = await asyncio.start_server(runtime.handle_relay, relay_host, relay_port)
+    relay = await asyncio.start_server(
+        runtime.handle_relay,
+        relay_host,
+        relay_port,
+        limit=runtime.RELAY_LINE_LIMIT_BYTES,
+    )
     bulk = await asyncio.start_server(runtime.handle_bulk, bulk_host, bulk_port)
     LOG.info("control listening on %s:%s", control_host, control_port)
     LOG.info("relay listening on %s:%s", relay_host, relay_port)
