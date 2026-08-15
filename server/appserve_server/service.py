@@ -10,9 +10,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
 from .core import RelayConfig, RelayState, parse_bootstrap
 
 LOG = logging.getLogger("appserve.relay")
+
+
+def valid_endpoint_public_key(value: str) -> bool:
+    try:
+        encoded = value + "=" * (-len(value) % 4)
+        key = serialization.load_der_public_key(base64.urlsafe_b64decode(encoded))
+        return isinstance(key, rsa.RSAPublicKey) and key.key_size >= 2048
+    except (ValueError, TypeError, base64.binascii.Error):
+        return False
 
 
 @dataclass
@@ -28,7 +40,7 @@ class RelayRuntime:
         for manifest in self.state.wisps.values():
             owner = manifest.get("owner")
             public_key = self.state.clients.get(owner, {}).get("public_key")
-            if not public_key:
+            if not public_key or not valid_endpoint_public_key(public_key):
                 continue
             items.append({**manifest, "public_key": public_key})
         return items

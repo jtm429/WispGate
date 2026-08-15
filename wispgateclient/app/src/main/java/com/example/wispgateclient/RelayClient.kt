@@ -21,6 +21,14 @@ import java.security.KeyFactory
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
 
+object PeerKeyPolicy {
+    fun resolve(owner: String, known: String?, advertised: String): String {
+        if (known == null || known == owner) return advertised
+        if (known != advertised) throw SecurityException("Public key changed for $owner")
+        return known
+    }
+}
+
 class RelayClient(private val context: Context) {
     data class ServerInfo(
         val host: String,
@@ -220,11 +228,9 @@ class RelayClient(private val context: Context) {
     private fun trustedPeerKey(owner: String, advertisedKey: String): String {
         val preference = "peer_public_key_$owner"
         val known = preferences.getString(preference, null)
-        if (known != null && known != advertisedKey) {
-            throw SecurityException("Public key changed for $owner")
-        }
-        if (known == null) preferences.edit().putString(preference, advertisedKey).apply()
-        return known ?: advertisedKey
+        val resolved = PeerKeyPolicy.resolve(owner, known, advertisedKey)
+        if (known != resolved) preferences.edit().putString(preference, resolved).apply()
+        return resolved
     }
 
     private fun send(output: BufferedWriter, value: String) {

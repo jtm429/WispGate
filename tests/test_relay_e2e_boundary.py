@@ -6,6 +6,7 @@ from pathlib import Path
 
 from server.appserve_server.core import RelayConfig, RelayState
 from server.appserve_server.service import RelayRuntime
+from appserve.e2e import generate_identity, public_key_text
 
 
 class RecordingWriter:
@@ -25,7 +26,8 @@ def runtime(tmp_path: Path) -> RelayRuntime:
 
 def test_catalog_distributes_wisp_owner_public_key(tmp_path: Path) -> None:
     relay = runtime(tmp_path)
-    relay.state.clients["prime-wisp"] = {"public_key": "prime-public-key"}
+    public_key = public_key_text(generate_identity())
+    relay.state.clients["prime-wisp"] = {"public_key": public_key}
     relay.state.wisps["prime"] = {
         "id": "prime",
         "name": "Prime tester",
@@ -39,9 +41,17 @@ def test_catalog_distributes_wisp_owner_public_key(tmp_path: Path) -> None:
             "name": "Prime tester",
             "description": "",
             "owner": "prime-wisp",
-            "public_key": "prime-public-key",
+            "public_key": public_key,
         }
     ]
+
+
+def test_catalog_omits_legacy_client_id_placeholder_key(tmp_path: Path) -> None:
+    relay = runtime(tmp_path)
+    relay.state.clients["prime-wisp"] = {"public_key": "prime-wisp"}
+    relay.state.wisps["prime"] = {"id": "prime", "name": "Prime", "owner": "prime-wisp"}
+
+    assert relay.catalog_items() == []
 
 
 def test_bootstrap_placeholder_cannot_replace_registered_endpoint_key(tmp_path: Path) -> None:

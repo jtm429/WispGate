@@ -77,4 +77,17 @@ class E2EEnvelopeTest {
 
         assertEquals("<p>python encrypted</p>", decrypted.body.getJSONObject("response").getString("html"))
     }
+
+    @Test
+    fun migratesOnlyLegacyOwnerNamePlaceholderKey() {
+        val realKey = E2EEnvelope.publicKeyText(identity().public)
+
+        assertEquals(realKey, PeerKeyPolicy.resolve("prime-wisp", "prime-wisp", realKey))
+        assertEquals(realKey, PeerKeyPolicy.resolve("prime-wisp", null, realKey))
+        assertEquals(realKey, PeerKeyPolicy.resolve("prime-wisp", realKey, realKey))
+
+        val changed = E2EEnvelope.publicKeyText(identity().public)
+        val error = runCatching { PeerKeyPolicy.resolve("prime-wisp", realKey, changed) }.exceptionOrNull()
+        assertTrue(error is SecurityException)
+    }
 }
