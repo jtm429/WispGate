@@ -144,6 +144,37 @@ class WispFileTransferTest {
     }
 
     @Test
+    fun foregroundServiceStopsOnlyAfterEveryConcurrentTransferFinishes() {
+        val ownership = BulkTransferOwnership()
+        ownership.started("older", 1)
+        ownership.started("newer", 2)
+
+        assertEquals(null, ownership.finished("newer"))
+        assertEquals(2, ownership.finished("older"))
+    }
+
+    @Test
+    fun foregroundExecutionCleansStagingWhenWakeLockAcquisitionFails() {
+        val directory = Files.createTempDirectory("wisp-service-cleanup-test").toFile()
+        directory.resolve("0.upload").writeText("plaintext")
+        val action = StagedFileAction("cleanup-transfer", JSONObject(), directory, emptyList())
+
+        val failure = runCatching {
+            kotlinx.coroutines.runBlocking {
+                BulkTransferExecution.run(
+                    action = action,
+                    acquireWakeLock = { error("wake lock unavailable") },
+                    wakeLockHeld = { false },
+                    releaseWakeLock = {},
+                ) { error("transfer must not start") }
+            }
+        }.exceptionOrNull()
+
+        assertTrue(failure is IllegalStateException)
+        assertFalse(directory.exists())
+    }
+
+    @Test
     fun preparesOneHybridEncryptedRawStreamWithoutChunkMessages() {
         val directory = Files.createTempDirectory("wisp-protocol-test").toFile()
         val file = directory.resolve("0.upload").apply { writeText("hello") }
@@ -165,8 +196,40 @@ class WispFileTransferTest {
         )
         val begin = FileActionProtocol.begin("wisp-1", action, prepared)
         val offer = begin.getJSONArray("files").getJSONObject(0).getJSONObject("bulk")
-        val encrypted = java.io.ByteArrayOutputStream()
-        prepared.single().encryptTo(encrypted)
+        val server = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())
+        val receivedHeader = java.util.concurrent.atomic.AtomicReference<JSONObject>()
+        val receivedCiphertext = java.util.concurrent.atomic.AtomicReference<ByteArray>()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val serverTask = executor.submit {
+            server.accept().use { socket ->
+                val input = socket.getInputStream()
+                val headerBytes = java.io.ByteArrayOutputStream()
+                while (true) {
+                    val next = input.read()
+                    require(next >= 0) { "sender closed before bulk header" }
+                    if (next == '\n'.code) break
+                    headerBytes.write(next)
+                }
+                receivedHeader.set(JSONObject(headerBytes.toString(Charsets.UTF_8.name())))
+                socket.getOutputStream().write("{\"ok\":true,\"type\":\"bulk_ready\"}\n".toByteArray())
+                socket.getOutputStream().flush()
+                receivedCiphertext.set(input.readNBytes(prepared.single().ciphertextSize.toInt()))
+                socket.getOutputStream().write("{\"ok\":true,\"type\":\"bulk_complete\"}\n".toByteArray())
+                socket.getOutputStream().flush()
+            }
+        }
+
+        BulkSocketTransport.send(
+            host = java.net.InetAddress.getLoopbackAddress().hostAddress!!,
+            port = server.localPort,
+            recipient = "wisp-owner",
+            sessionToken = "session-token",
+            upload = prepared.single(),
+        )
+        serverTask.get(5, java.util.concurrent.TimeUnit.SECONDS)
+        executor.shutdownNow()
+        server.close()
+        val encrypted = receivedCiphertext.get()
 
         val unwrap = javax.crypto.Cipher.getInstance("RSA/ECB/OAEPPadding").apply {
             init(javax.crypto.Cipher.DECRYPT_MODE, keyPair.private, E2EEnvelope.oaepParameters())
@@ -184,8 +247,19 @@ class WispFileTransferTest {
         assertEquals("file_begin", begin.getString("action"))
         assertEquals("RSA-OAEP-256+A256GCM", offer.getString("algorithm"))
         assertTrue(offer.getString("ticket").length >= 16)
-        assertEquals(21, encrypted.size())
-        assertEquals("hello", String(decrypt.doFinal(encrypted.toByteArray())))
+        assertEquals(
+            JSONObject()
+                .put("type", "bulk")
+                .put("session_token", "session-token")
+                .put("ticket", prepared.single().ticket)
+                .put("role", "sender")
+                .put("peer", "wisp-owner")
+                .put("length", prepared.single().ciphertextSize)
+                .toString(),
+            receivedHeader.get().toString(),
+        )
+        assertEquals(21, encrypted.size)
+        assertEquals("hello", String(decrypt.doFinal(encrypted)))
         assertFalse(begin.toString().contains("file_chunk"))
         action.cleanup()
     }

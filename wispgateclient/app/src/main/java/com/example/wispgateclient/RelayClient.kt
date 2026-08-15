@@ -234,7 +234,7 @@ class RelayClient(private val context: Context) {
             Log.i("WispFileTransfer", "Wisp ready transfer=${action.transferId} bulkFiles=${prepared.size}")
 
             prepared.forEach { upload ->
-                sendBulkFile(info, wisp.owner, token, upload)
+                BulkSocketTransport.send(info.host, info.bulkPort, wisp.owner, token, upload)
                 Log.i("WispFileTransfer", "bulk file sent id=${upload.file.id} bytes=${upload.file.size}")
             }
 
@@ -245,36 +245,6 @@ class RelayClient(private val context: Context) {
             Log.i("WispFileTransfer", "bulk action accepted transfer=${action.transferId}")
             WispState(wisp.id, completed.optJSONObject("response")?.optString("html", "") ?: "")
         }
-        }
-    }
-
-    private fun sendBulkFile(info: ServerInfo, recipient: String, token: String, upload: PreparedBulkUpload) {
-        Socket(info.host, info.bulkPort).use { socket ->
-            socket.soTimeout = 10 * 60_000
-            val input = socket.reader()
-            val output = socket.writer()
-            send(
-                output,
-                JSONObject()
-                    .put("type", "bulk")
-                    .put("session_token", token)
-                    .put("ticket", upload.ticket)
-                    .put("role", "sender")
-                    .put("peer", recipient)
-                    .put("length", upload.ciphertextSize)
-                    .toString(),
-            )
-            val ready = input.readJson("bulk relay readiness")
-            if (!ready.optBoolean("ok") || ready.optString("type") != "bulk_ready") {
-                error(ready.optString("error", "Bulk relay rejected transfer"))
-            }
-            val written = upload.encryptTo(socket.getOutputStream())
-            socket.getOutputStream().flush()
-            require(written == upload.ciphertextSize) { "Bulk ciphertext length mismatch" }
-            val complete = input.readJson("bulk relay completion")
-            if (!complete.optBoolean("ok") || complete.optString("type") != "bulk_complete") {
-                error(complete.optString("error", "Bulk relay did not complete transfer"))
-            }
         }
     }
 

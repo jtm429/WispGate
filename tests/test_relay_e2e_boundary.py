@@ -203,3 +203,42 @@ def test_bulk_relay_rejects_unknown_session_token(tmp_path: Path) -> None:
             await server.wait_closed()
 
     asyncio.run(scenario())
+
+
+def test_bulk_relay_times_out_a_stalled_ciphertext_and_closes_both_peers(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        relay = runtime(tmp_path)
+        relay.BULK_IO_TIMEOUT_SECONDS = 0.05
+        relay.state.clients["android-user"] = {"session_token": "android-token"}
+        relay.state.clients["upload-wisp"] = {"session_token": "wisp-token"}
+        server = await asyncio.start_server(relay.handle_bulk, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        receiver_writer = sender_writer = None
+        try:
+            receiver_reader, receiver_writer = await asyncio.open_connection("127.0.0.1", port)
+            receiver_writer.write(json.dumps({
+                "type": "bulk", "session_token": "wisp-token", "ticket": "stalled-ticket-123",
+                "role": "receiver", "peer": "android-user", "length": 16,
+            }).encode() + b"\n")
+            await receiver_writer.drain()
+            sender_reader, sender_writer = await asyncio.open_connection("127.0.0.1", port)
+            sender_writer.write(json.dumps({
+                "type": "bulk", "session_token": "android-token", "ticket": "stalled-ticket-123",
+                "role": "sender", "peer": "upload-wisp", "length": 16,
+            }).encode() + b"\n")
+            await sender_writer.drain()
+
+            assert json.loads(await sender_reader.readline()) == {"ok": True, "type": "bulk_ready"}
+            assert json.loads(await receiver_reader.readline()) == {"ok": True, "type": "bulk_ready"}
+            assert await asyncio.wait_for(sender_reader.read(), timeout=0.5) == b""
+            assert await asyncio.wait_for(receiver_reader.read(), timeout=0.5) == b""
+            assert relay.pending_bulk == {}
+        finally:
+            for writer in (sender_writer, receiver_writer):
+                if writer is not None:
+                    writer.close()
+                    await writer.wait_closed()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())

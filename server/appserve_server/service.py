@@ -42,6 +42,7 @@ class RelayRuntime:
     MAX_BULK_BYTES = 256 * 1024 * 1024 + 16
     MAX_PENDING_BULK = 128
     BULK_TICKET_TTL_SECONDS = 10 * 60
+    BULK_IO_TIMEOUT_SECONDS = 10 * 60
 
     def catalog_items(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -256,13 +257,20 @@ class RelayRuntime:
         receiver.paired.set()
         await send_json(sender.writer, {"ok": True, "type": "bulk_ready"})
         await send_json(receiver.writer, {"ok": True, "type": "bulk_ready"})
+        await asyncio.wait_for(
+            self._copy_bulk_ciphertext(sender, receiver),
+            timeout=self.BULK_IO_TIMEOUT_SECONDS,
+        )
+        await send_json(sender.writer, {"ok": True, "type": "bulk_complete"})
+
+    @staticmethod
+    async def _copy_bulk_ciphertext(sender: "_BulkConnection", receiver: "_BulkConnection") -> None:
         remaining = sender.length
         while remaining:
             chunk = await sender.reader.readexactly(min(256 * 1024, remaining))
             receiver.writer.write(chunk)
             await receiver.writer.drain()
             remaining -= len(chunk)
-        await send_json(sender.writer, {"ok": True, "type": "bulk_complete"})
 
     async def forward(self, sender: str, envelope: dict[str, Any]) -> None:
         recipient = envelope.get("recipient")

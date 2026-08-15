@@ -42,6 +42,46 @@ data class BulkTransferResult(
     val error: String? = null,
 )
 
+/** Keeps the service alive until the last concurrently started transfer releases ownership. */
+class BulkTransferOwnership {
+    private val active = mutableSetOf<String>()
+    private var latestStartId = 0
+
+    @Synchronized
+    fun started(transferId: String, startId: Int) {
+        require(active.add(transferId)) { "Transfer is already active" }
+        latestStartId = maxOf(latestStartId, startId)
+    }
+
+    @Synchronized
+    fun finished(transferId: String): Int? {
+        active.remove(transferId)
+        return latestStartId.takeIf { active.isEmpty() }
+    }
+
+    @Synchronized
+    fun hasActiveTransfers(): Boolean = active.isNotEmpty()
+}
+
+object BulkTransferExecution {
+    suspend fun <T> run(
+        action: StagedFileAction,
+        acquireWakeLock: () -> Unit,
+        wakeLockHeld: () -> Boolean,
+        releaseWakeLock: () -> Unit,
+        transfer: suspend () -> T,
+    ): T = try {
+        acquireWakeLock()
+        transfer()
+    } finally {
+        try {
+            action.cleanup()
+        } finally {
+            if (wakeLockHeld()) releaseWakeLock()
+        }
+    }
+}
+
 class BulkTransferService : Service() {
     companion object {
         private const val CHANNEL_ID = "wispgate-transfers"
@@ -66,6 +106,7 @@ class BulkTransferService : Service() {
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val ownership = BulkTransferOwnership()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -92,15 +133,22 @@ class BulkTransferService : Service() {
         val transferId = intent?.getStringExtra(EXTRA_TRANSFER_ID)
         val job = transferId?.let(BulkTransferJobs::take)
         if (job == null) {
-            stopSelf(startId)
+            if (!ownership.hasActiveTransfers()) stopSelf(startId)
             return START_NOT_STICKY
         }
+        ownership.started(job.action.transferId, startId)
         scope.launch {
             val wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WispGate:BulkTransfer")
-            wakeLock.acquire(30 * 60_000L)
             try {
-                val state = RelayClient(applicationContext).sendFileAction(job.server, job.wisp, job.action)
+                val state = BulkTransferExecution.run(
+                    action = job.action,
+                    acquireWakeLock = { wakeLock.acquire(30 * 60_000L) },
+                    wakeLockHeld = wakeLock::isHeld,
+                    releaseWakeLock = wakeLock::release,
+                ) {
+                    RelayClient(applicationContext).sendFileAction(job.server, job.wisp, job.action)
+                }
                 _results.emit(BulkTransferResult(job.action.transferId, job.wisp.id, html = state.html))
             } catch (cause: Throwable) {
                 _results.emit(
@@ -111,15 +159,7 @@ class BulkTransferService : Service() {
                     ),
                 )
             } finally {
-                try {
-                    job.action.cleanup()
-                } finally {
-                    try {
-                        if (wakeLock.isHeld) wakeLock.release()
-                    } finally {
-                        stopSelf(startId)
-                    }
-                }
+                ownership.finished(job.action.transferId)?.let(::stopSelf)
             }
         }
         return START_NOT_STICKY
