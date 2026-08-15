@@ -1,6 +1,7 @@
 package com.example.wispgateclient
 
 import android.os.Bundle
+import android.util.Log
 import android.webkit.WebView
 import android.webkit.JavascriptInterface
 import androidx.activity.ComponentActivity
@@ -226,6 +227,7 @@ private fun WispGateApp(client: RelayClient) {
                                 try {
                                     html = client.requestState(server!!, wisp).html
                                 } catch (cause: Throwable) {
+                                    Log.e("WispGate", "Unable to request Wisp state", cause)
                                     error = cause.message ?: "Unable to request Wisp state"
                                     selected = null
                                 }

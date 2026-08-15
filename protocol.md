@@ -15,7 +15,7 @@ The relay's public bootstrap key is used only to protect the first join message.
 
 - Client identity: persistent 3072-bit RSA key pair.
 - Payload encryption: fresh AES-256-GCM key and 96-bit nonce per message.
-- Content-key wrapping: RSA-OAEP with SHA-256 and MGF1-SHA-256.
+- Content-key wrapping: RSA-OAEP with SHA-256 and MGF1-SHA-1, matching Android Keystore's persisted-key authorization and the standard Android OAEP provider behavior.
 - Sender authentication: RSA-PSS with SHA-256 and a 32-byte salt.
 - Randomness: operating-system CSPRNG.
 - Public-key bootstrap: a maintained hybrid-encryption implementation such as HPKE, if available for the selected language.

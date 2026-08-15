@@ -7,6 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.KeyPairGenerator
 import java.security.KeyFactory
+import java.security.spec.MGF1ParameterSpec
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.Base64
 
@@ -23,6 +24,12 @@ class E2EEnvelopeTest {
             "RSASSA-PSS",
             E2EEnvelope.selectPssAlgorithm { it == "RSASSA-PSS" },
         )
+    }
+
+    @Test
+    fun usesMgfDigestAuthorizedByPersistedAndroidIdentity() {
+        val mgf = E2EEnvelope.oaepParameters().mgfParameters as MGF1ParameterSpec
+        assertEquals("SHA-1", mgf.digestAlgorithm)
     }
 
     @Test

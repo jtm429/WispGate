@@ -106,13 +106,12 @@ object E2EEnvelope {
     private fun decodePublicKey(value: String): PublicKey =
         KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(decode64(value)))
 
+    fun oaepParameters() =
+        OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA1, PSource.PSpecified.DEFAULT)
+
     private fun rsaCipher(mode: Int, key: java.security.Key): Cipher =
         Cipher.getInstance("RSA/ECB/OAEPPadding").apply {
-            init(
-                mode,
-                key,
-                OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT),
-            )
+            init(mode, key, oaepParameters())
         }
 
     fun selectPssAlgorithm(available: (String) -> Boolean): String =

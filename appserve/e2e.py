@@ -110,7 +110,7 @@ def encrypt_envelope(
         _public_key(recipient_public_key).encrypt(
             content_key,
             padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                mgf=padding.MGF1(algorithm=hashes.SHA1()),
                 algorithm=hashes.SHA256(),
                 label=None,
             ),
@@ -155,7 +155,7 @@ def decrypt_envelope(
     content_key = recipient_private_key.decrypt(
         _unb64(envelope["encrypted_key"]),
         padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            mgf=padding.MGF1(algorithm=hashes.SHA1()),
             algorithm=hashes.SHA256(),
             label=None,
         ),
