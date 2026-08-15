@@ -12,3 +12,5 @@ state/
 .DS_Store
 Thumbs.db
 serverinfo.txt
+.*-identity.pem
+.*-peers.json

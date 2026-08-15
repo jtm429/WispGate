@@ -114,7 +114,7 @@ The relay state file and private key are in `/var/lib/wispgate`, so they survive
 
 - The current service uses newline-delimited JSON over two asyncio TCP ports.
 - The bootstrap payload is encrypted to the relay RSA public key.
-- The application envelope's `ciphertext` is treated as opaque, but this MVP does not yet implement client-side end-to-end session-key negotiation.
+- Application envelopes contain only authenticated routing metadata, wrapped content keys, nonces, signatures, optional public-key advertisements, and opaque ciphertext. The relay rejects plaintext application `body` fields and cannot decrypt Wisp state or actions.
 - The sockets are currently plaintext TCP. Before public deployment, add TLS termination in front of both ports or wire `ssl.SSLContext` into `asyncio.start_server`.
 - The relay startup reconnect behavior is represented in the protocol design, but direct relay-initiated NAT reconnection requires a future transport implementation. Clients' reconnect loops work with this MVP.
 

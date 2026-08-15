@@ -23,6 +23,16 @@ class RelayRuntime:
     control_sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
     update_command: tuple[str, ...] | None = None
 
+    def catalog_items(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for manifest in self.state.wisps.values():
+            owner = manifest.get("owner")
+            public_key = self.state.clients.get(owner, {}).get("public_key")
+            if not public_key:
+                continue
+            items.append({**manifest, "public_key": public_key})
+        return items
+
     async def handle_control(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         try:
@@ -34,7 +44,7 @@ class RelayRuntime:
             payload = parse_bootstrap(self.config, request["payload"].encode("ascii"))
             client_id = payload["client_id"]
             client_key = payload["client_public_key"]
-            self.state.register_client(client_id, client_key)
+            self.state.register_client(client_id, client_key, replace=False)
             token = secrets.token_urlsafe(32)
             self.state.clients[client_id]["session_token"] = token
             self.state.save()
@@ -46,13 +56,15 @@ class RelayRuntime:
                     "client_id": client_id,
                     "session_token": token,
                     "queued": len(self.state.queues.get(client_id, [])),
-                    "wisps": list(self.state.wisps.values()),
+                    "wisps": self.catalog_items(),
                 },
             )
             registration = await asyncio.wait_for(reader.readline(), timeout=2)
             if registration:
                 message = json.loads(registration)
                 if message.get("type") == "wisps":
+                    if message.get("client_public_key"):
+                        self.state.register_client(client_id, message["client_public_key"])
                     self.state.remove_wisps_for_owner(client_id)
                     for item in message.get("items", []):
                         if item.get("id"):
@@ -63,7 +75,7 @@ class RelayRuntime:
                                 "owner": client_id,
                             }
                     self.state.save()
-                    await send_json(writer, {"ok": True, "type": "wisps_registered", "items": list(self.state.wisps.values())})
+                    await send_json(writer, {"ok": True, "type": "wisps_registered", "items": self.catalog_items()})
                     await self.broadcast_catalog()
                     if client_id == "android-user":
                         self.control_sessions[client_id] = (token, writer)
@@ -82,7 +94,7 @@ class RelayRuntime:
             await writer.wait_closed()
 
     async def broadcast_catalog(self) -> None:
-        message = {"ok": True, "type": "catalog_update", "items": list(self.state.wisps.values())}
+        message = {"ok": True, "type": "catalog_update", "items": self.catalog_items()}
         stale: list[str] = []
         for client_id, (_, writer) in list(self.control_sessions.items()):
             try:
@@ -144,7 +156,15 @@ class RelayRuntime:
 
     async def forward(self, sender: str, envelope: dict[str, Any]) -> None:
         recipient = envelope.get("recipient")
-        if not recipient or envelope.get("sender") != sender or "ciphertext" not in envelope:
+        required = {"version", "type", "sender", "recipient", "message_id", "algorithm", "encrypted_key", "nonce", "ciphertext", "signature"}
+        allowed = required | {"sender_public_key"}
+        if (
+            not recipient
+            or envelope.get("sender") != sender
+            or envelope.get("type") != "envelope"
+            or not set(envelope).issubset(allowed)
+            or not required.issubset(envelope)
+        ):
             session = self.sessions.get(sender)
             if session:
                 await send_json(session[1], {"ok": False, "error": "invalid_envelope"})
@@ -159,15 +179,8 @@ class RelayRuntime:
                 await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
             await send_json(destination[1], envelope)
         else:
-            body = envelope.get("body", {})
-            if body.get("action") in {"state_request", "user_action"}:
-                if source:
-                    await send_json(source[1], {"ok": False, "error": "recipient_offline"})
-                return
-            self.state.queue(recipient, envelope)
-            self.state.save()
             if source:
-                await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
+                await send_json(source[1], {"ok": False, "error": "recipient_offline"})
 
 
 async def send_json(writer: asyncio.StreamWriter, value: dict[str, Any]) -> None:

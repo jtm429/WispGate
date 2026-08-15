@@ -109,9 +109,10 @@ class RelayState:
         temporary.write_text(json.dumps({"clients": self.clients, "queues": self.queues, "wisps": self.wisps}), encoding="utf-8")
         temporary.replace(self.path)
 
-    def register_client(self, client_id: str, public_key: str) -> None:
+    def register_client(self, client_id: str, public_key: str, *, replace: bool = True) -> None:
         record = self.clients.setdefault(client_id, {})
-        record["public_key"] = public_key
+        if replace or "public_key" not in record:
+            record["public_key"] = public_key
         record["last_seen"] = int(time.time())
 
     def queue(self, client_id: str, envelope: dict[str, Any]) -> None:

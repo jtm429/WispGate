@@ -2,25 +2,25 @@
 
 ## Status
 
-This is a design specification, not an implementation. Version 1 favors a simple persistent WebSocket transport and explicit message envelopes. The cryptographic primitives should use a maintained library rather than handwritten cryptography.
+Version 1 uses explicit JSON message envelopes over persistent relay sockets. Application payloads are encrypted and signed by the endpoint runtimes before they are sent to the relay.
 
 ## Two encryption layers
 
-1. **Transport encryption**: TLS on both server ports. This protects connections and bootstrap traffic from network observers.
+1. **Transport encryption target**: TLS on both server ports. The current deployment still uses raw TCP, so TLS remains required before public deployment.
 2. **Application end-to-end encryption**: the sender encrypts the application payload for the recipient before it reaches the relay. The relay forwards ciphertext and cannot decrypt it.
 
 The relay's public bootstrap key is used only to protect the first join message. It is not the key used to encrypt every application payload.
 
-## Suggested cryptographic shape
+## Version 1 cryptographic shape
 
-- Client identity: Ed25519 signing key pair.
-- Key agreement: X25519 key pair or an established authenticated session protocol.
-- Payload encryption: ChaCha20-Poly1305 or AES-256-GCM.
-- Key derivation: HKDF-SHA-256.
+- Client identity: persistent 3072-bit RSA key pair.
+- Payload encryption: fresh AES-256-GCM key and 96-bit nonce per message.
+- Content-key wrapping: RSA-OAEP with SHA-256 and MGF1-SHA-256.
+- Sender authentication: RSA-PSS with SHA-256 and a 32-byte salt.
 - Randomness: operating-system CSPRNG.
 - Public-key bootstrap: a maintained hybrid-encryption implementation such as HPKE, if available for the selected language.
 
-The protocol must not invent its own public-key encryption format. The exact Python library and wire encoding are implementation decisions.
+All binary fields use unpadded base64url. The authenticated routing metadata is canonical JSON containing `algorithm`, `message_id`, `recipient`, `sender`, `type`, and `version`. The relay rejects application envelopes containing a plaintext `body` field.
 
 ## Session establishment
 
@@ -60,19 +60,31 @@ When a Wisp client joins, it registers its manifest:
 ```json
 {
   "type": "wisps",
-  "items": [{"id": "prime", "name": "Prime tester", "description": "..."}]
+  "items": [{"id": "prime", "name": "Prime tester", "description": "...", "owner": "prime-wisp", "public_key": "base64url-DER"}]
 }
 ```
 
-The relay persists the catalog metadata and returns it to user clients during join. The user client can display this as a contacts-like list without knowing anything about the Wisp's UI.
+The relay persists the catalog metadata and returns it to user clients during join. Each item carries its Wisp owner's public key so the Android endpoint can encrypt the first request before sending it. The user client can display the list without knowing anything about the Wisp's UI.
 
 Selecting a Wisp sends a generic, non-mutating state request:
 
 ```json
-{"wisp_id": "prime", "action": "state_request"}
+{
+  "version": 1,
+  "type": "envelope",
+  "sender": "android-user",
+  "recipient": "prime-wisp",
+  "message_id": "...",
+  "algorithm": "RSA-OAEP-256+A256GCM+PS256",
+  "encrypted_key": "...",
+  "nonce": "...",
+  "ciphertext": "...",
+  "signature": "...",
+  "sender_public_key": "base64url-DER"
+}
 ```
 
-The Wisp responds with its current complete UI/state. This request must not advance the Wisp's turn or invoke its ordinary action handler. Other UI events are sent as applet-defined actions and may advance the turn.
+The ciphertext decrypts at the Wisp to `{"wisp_id":"prime","action":"state_request"}`. The first refresh advertises Android's public key so the Wisp can authenticate the request and encrypt its response directly to Android. The Wisp pins that key on first use and rejects later substitutions. It responds with its current complete UI/state; this request must not advance the Wisp's turn or invoke its ordinary action handler. Other UI events are encrypted applet-defined actions and may advance the turn.
 
 An Android host keeps its control connection open after catalog registration. When a Wisp registers or disconnects, the relay pushes:
 
@@ -115,11 +127,11 @@ Receivers deduplicate message IDs. Retries are safe. The relay's acknowledgement
 
 ## Key distribution
 
-The relay may distribute public identity keys and key metadata, but clients verify fingerprints against their private deployment configuration or a manually trusted first-use record. The relay must not silently replace a known peer key.
+The relay distributes Wisp public keys in catalog entries. Android includes its public key on each state-refresh envelope, including the first click. Both endpoints persist a trust-on-first-use record and reject a later key substitution. Public keys and routing metadata remain visible to the relay; decrypted application bodies do not.
 
 ## Threat model
 
-The design protects application contents from:
+After peer keys have been pinned, the design protects application contents from:
 
 - a compromised relay server;
 - relay database disclosure;
@@ -127,6 +139,8 @@ The design protects application contents from:
 - a malicious relay forwarding, dropping, delaying, or replaying traffic.
 
 It does not hide metadata such as connection timing, message sizes, routing IDs, or online status from the relay. It does not protect a client whose private keys or runtime are already compromised.
+
+The initial catalog/refresh key exchange is trust-on-first-use. A relay already compromised before the first contact could substitute both endpoint keys. For protection against that first-contact attack, compare the endpoint fingerprints through an out-of-band trusted channel before accepting them.
 
 ## Host-provided Wisp theme
 

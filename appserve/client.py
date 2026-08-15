@@ -13,6 +13,14 @@ from typing import Any, Awaitable, Callable
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from .e2e import (
+    decrypt_envelope,
+    encrypt_envelope,
+    generate_identity,
+    load_or_create_identity,
+    public_key_text,
+)
+
 
 LOG = logging.getLogger(__name__)
 
@@ -39,13 +47,20 @@ class Wisp:
 
 
 class AppserveClient:
-    def __init__(self, info: ServerInfo, client_id: str):
+    def __init__(self, info: ServerInfo, client_id: str, *, identity_key=None, peer_store_path: str | Path | None = None):
         self.info = info
         self.client_id = client_id
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._session_token: str | None = None
         self._wisps: dict[str, Wisp] = {}
+        self._identity_key = identity_key or generate_identity()
+        self._peer_store_path = Path(peer_store_path) if peer_store_path else None
+        self._peer_keys: dict[str, str] = {}
+        if self._peer_store_path and self._peer_store_path.exists():
+            stored = json.loads(self._peer_store_path.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                self._peer_keys = {str(key): str(value) for key, value in stored.items()}
 
     def register(self, wisp: Wisp) -> None:
         self._wisps[wisp.id] = wisp
@@ -78,7 +93,7 @@ class AppserveClient:
             if not joined.get("ok"):
                 raise ConnectionError(joined.get("error", "join failed"))
             self._session_token = joined["session_token"]
-            await self._send(writer, {"type": "wisps", "items": [w.manifest() for w in self._wisps.values()]})
+            await self._send(writer, self._registration_message())
         finally:
             writer.close()
             await writer.wait_closed()
@@ -115,27 +130,61 @@ class AppserveClient:
             message = json.loads(line)
             if message.get("type") != "envelope":
                 continue
-            body = message.get("body", {})
-            wisp = self._wisps.get(body.get("wisp_id"))
-            if not wisp:
-                continue
-            if body.get("action") == "state_request":
-                state = wisp.state()
-            else:
-                result = wisp.action(body.get("action_data", {}))
-                state = await result if asyncio.iscoroutine(result) else result
-            await self._send_envelope(message["sender"], {"wisp_id": wisp.id, "response": state})
+            await self._handle_envelope(message)
+
+    def peer_public_key(self, client_id: str) -> str | None:
+        return self._peer_keys.get(client_id)
+
+    def _registration_message(self) -> dict[str, Any]:
+        return {
+            "type": "wisps",
+            "client_public_key": public_key_text(self._identity_key),
+            "items": [w.manifest() for w in self._wisps.values()],
+        }
+
+    def _remember_peer(self, client_id: str, public_key: str) -> None:
+        known = self._peer_keys.get(client_id)
+        if known and known != public_key:
+            raise ValueError(f"peer public key changed for {client_id}")
+        if known:
+            return
+        self._peer_keys[client_id] = public_key
+        if self._peer_store_path:
+            self._peer_store_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._peer_store_path.with_suffix(self._peer_store_path.suffix + ".tmp")
+            temporary.write_text(json.dumps(self._peer_keys, sort_keys=True), encoding="utf-8")
+            temporary.replace(self._peer_store_path)
+
+    async def _handle_envelope(self, message: dict[str, Any]) -> None:
+        sender = message["sender"]
+        body, sender_key = decrypt_envelope(message, self._identity_key, self._peer_keys.get(sender))
+        self._remember_peer(sender, sender_key)
+        wisp = self._wisps.get(body.get("wisp_id"))
+        if not wisp:
+            return
+        if body.get("action") == "state_request":
+            state = wisp.state()
+        else:
+            result = wisp.action(body.get("action_data", {}))
+            state = await result if asyncio.iscoroutine(result) else result
+        await self._send_envelope(sender, {"wisp_id": wisp.id, "response": state})
 
     async def _send_envelope(self, recipient: str, body: dict[str, Any]) -> None:
         assert self._writer is not None
-        await self._send(self._writer, {
-            "type": "envelope",
-            "sender": self.client_id,
-            "recipient": recipient,
-            "message_id": secrets.token_urlsafe(16),
-            "ciphertext": "appserve-v1",
-            "body": body,
-        })
+        recipient_key = self._peer_keys.get(recipient)
+        if not recipient_key:
+            raise ValueError(f"no trusted public key for {recipient}")
+        await self._send(
+            self._writer,
+            encrypt_envelope(
+                sender=self.client_id,
+                recipient=recipient,
+                message_id=secrets.token_urlsafe(16),
+                body=body,
+                recipient_public_key=recipient_key,
+                sender_private_key=self._identity_key,
+            ),
+        )
 
     def _bootstrap_payload(self) -> str:
         key = serialization.load_der_public_key(self.info.server_public_key)
@@ -163,8 +212,12 @@ class AppserveClient:
 
 
 def load(path: str | Path) -> AppserveClient:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    config_path = Path(path)
+    data = json.loads(config_path.read_text(encoding="utf-8"))
     key = data["server_public_key"]
+    client_id = data.get("client_id", "python-wisp")
+    identity_path = config_path.with_name(f".{config_path.stem}-{client_id}-identity.pem")
+    peers_path = config_path.with_name(f".{config_path.stem}-{client_id}-peers.json")
     return AppserveClient(
         ServerInfo(
             host=data["server"],
@@ -173,5 +226,7 @@ def load(path: str | Path) -> AppserveClient:
             server_public_key=base64.urlsafe_b64decode(key),
             deployment_id=data.get("deployment_id", "private"),
         ),
-        client_id=data.get("client_id", "python-wisp"),
+        client_id=client_id,
+        identity_key=load_or_create_identity(identity_path),
+        peer_store_path=peers_path,
     )

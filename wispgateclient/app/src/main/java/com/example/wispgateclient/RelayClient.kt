@@ -28,12 +28,13 @@ class RelayClient(private val context: Context) {
         val controlPort: Int = 443,
         val relayPort: Int = 4443,
     )
-    data class Wisp(val id: String, val name: String, val description: String, val owner: String)
+    data class Wisp(val id: String, val name: String, val description: String, val owner: String, val publicKey: String)
     data class WispState(val wispId: String, val html: String)
 
     data class ConnectionResult(val wisps: List<Wisp>, val sessionToken: String)
 
     private val preferences = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
+    private val identity by lazy { EndpointIdentity().keyPair() }
     private val controlScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var controlSocket: Socket? = null
     private var controlJob: Job? = null
@@ -68,7 +69,14 @@ class RelayClient(private val context: Context) {
             send(output, joinMessage(info, clientId))
             val joined = input.readJson("relay response")
             if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
-            send(output, JSONObject().put("type", "wisps").put("items", JSONArray()).toString())
+            send(
+                output,
+                JSONObject()
+                    .put("type", "wisps")
+                    .put("client_public_key", E2EEnvelope.publicKeyText(identity.public))
+                    .put("items", JSONArray())
+                    .toString(),
+            )
             val registration = input.readJson("relay response")
             if (!registration.optBoolean("ok")) error(registration.optString("error", "Wisp catalog registration failed"))
             val wisps = parseWisps(registration.optJSONArray("items") ?: JSONArray())
@@ -126,6 +134,7 @@ class RelayClient(private val context: Context) {
                     item.optString("name", item.getString("id")),
                     item.optString("description"),
                     item.optString("owner"),
+                    item.getString("public_key"),
                 ),
             )
         }
@@ -143,11 +152,12 @@ class RelayClient(private val context: Context) {
             val body = JSONObject()
                 .put("wisp_id", wisp.id)
                 .put("action", "state_request")
-            send(output, envelope(wisp.owner, body))
+            val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
+            send(output, envelope(wisp.owner, body, peerKey, advertisePublicKey = true))
             val accepted = input.readJson("relay response")
             if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Request rejected"))
             val response = input.readJson("relay response")
-            val responseBody = response.optJSONObject("body") ?: error("Wisp did not return state")
+            val responseBody = decryptResponse(response, wisp.owner, peerKey)
             WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
         }
     }
@@ -162,12 +172,13 @@ class RelayClient(private val context: Context) {
             val ready = input.readJson("relay response")
             if (!ready.optBoolean("ok")) error(ready.optString("error", "Relay session failed"))
             val body = JSONObject().put("wisp_id", wisp.id).put("action", "user_action").put("action_data", JSONObject(action))
-            send(output, envelope(wisp.owner, body))
+            val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
+            send(output, envelope(wisp.owner, body, peerKey, advertisePublicKey = false))
             val accepted = input.readJson("relay response")
             if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Action rejected"))
             val response = input.readJson("relay response")
-            val responseBody = JSONObject(response.getJSONObject("body").getString("response"))
-            WispState(wisp.id, responseBody.optString("html", ""))
+            val responseBody = decryptResponse(response, wisp.owner, peerKey)
+            WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
         }
     }
 
@@ -187,14 +198,34 @@ class RelayClient(private val context: Context) {
         return JSONObject().put("type", "join").put("payload", encrypted).toString()
     }
 
-    private fun envelope(recipient: String, body: JSONObject): String = JSONObject()
-        .put("type", "envelope")
-        .put("sender", "android-user")
-        .put("recipient", recipient)
-        .put("message_id", System.nanoTime().toString())
-        .put("ciphertext", "appserve-v1")
-        .put("body", body)
-        .toString()
+    private fun envelope(recipient: String, body: JSONObject, recipientPublicKey: String, advertisePublicKey: Boolean): String =
+        E2EEnvelope.encrypt(
+            sender = "android-user",
+            recipient = recipient,
+            messageId = System.nanoTime().toString(),
+            body = body,
+            recipientPublicKey = recipientPublicKey,
+            senderPrivateKey = identity.private,
+            senderPublicKey = identity.public,
+            advertiseSenderKey = advertisePublicKey,
+        ).toString()
+
+    private fun decryptResponse(envelope: JSONObject, sender: String, senderPublicKey: String): JSONObject {
+        if (envelope.optString("sender") != sender || envelope.optString("recipient") != "android-user") {
+            throw SecurityException("Unexpected encrypted response route")
+        }
+        return E2EEnvelope.decrypt(envelope, identity.private, senderPublicKey).body
+    }
+
+    private fun trustedPeerKey(owner: String, advertisedKey: String): String {
+        val preference = "peer_public_key_$owner"
+        val known = preferences.getString(preference, null)
+        if (known != null && known != advertisedKey) {
+            throw SecurityException("Public key changed for $owner")
+        }
+        if (known == null) preferences.edit().putString(preference, advertisedKey).apply()
+        return known ?: advertisedKey
+    }
 
     private fun send(output: BufferedWriter, value: String) {
         output.write(value)
