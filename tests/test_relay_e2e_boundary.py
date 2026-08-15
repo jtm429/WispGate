@@ -116,6 +116,61 @@ def test_offline_routing_does_not_require_decrypting_application_action(tmp_path
     assert relay.state.queues == {}
 
 
+def test_relay_routes_opaque_session_envelope_after_acceptance(tmp_path: Path) -> None:
+    relay = runtime(tmp_path)
+    sender = RecordingWriter()
+    recipient = RecordingWriter()
+    relay.sessions["android-user"] = ("token-a", sender)  # type: ignore[assignment]
+    relay.sessions["prime-wisp"] = ("token-p", recipient)  # type: ignore[assignment]
+    envelope = {
+        "version": 1, "type": "session_envelope", "session_id": "s1",
+        "sender": "android-user", "recipient": "prime-wisp", "sequence": 0,
+        "ciphertext": "opaque-ciphertext-and-tag",
+    }
+
+    asyncio.run(relay.forward("android-user", envelope))
+
+    assert sender.messages == [{"ok": True, "type": "accepted", "session_id": "s1", "sequence": 0}]
+    assert recipient.messages == [envelope]
+    assert "master_secret" not in str(recipient.messages)
+
+
+def test_relay_rejects_session_plaintext_spoofing_and_unknown_fields(tmp_path: Path) -> None:
+    relay = runtime(tmp_path)
+    sender = RecordingWriter()
+    recipient = RecordingWriter()
+    relay.sessions["android-user"] = ("token-a", sender)  # type: ignore[assignment]
+    relay.sessions["prime-wisp"] = ("token-p", recipient)  # type: ignore[assignment]
+    invalid = {
+        "version": 1, "type": "session_envelope", "session_id": "s1",
+        "sender": "attacker", "recipient": "prime-wisp", "sequence": 0,
+        "ciphertext": "opaque", "body": {"secret": True},
+    }
+
+    asyncio.run(relay.forward("android-user", invalid))
+
+    assert sender.messages == [{"ok": False, "error": "invalid_envelope"}]
+    assert recipient.messages == []
+
+
+def test_relay_rejects_session_sequence_outside_unsigned_64_bit_range(tmp_path: Path) -> None:
+    relay = runtime(tmp_path)
+    sender = RecordingWriter()
+    recipient = RecordingWriter()
+    relay.sessions["android-user"] = ("token-a", sender)  # type: ignore[assignment]
+    relay.sessions["prime-wisp"] = ("token-p", recipient)  # type: ignore[assignment]
+    invalid = {
+        "version": 1, "type": "session_envelope", "session_id": "s1",
+        "sender": "android-user", "recipient": "prime-wisp", "sequence": 1 << 64,
+        "ciphertext": "opaque",
+    }
+
+    asyncio.run(relay.forward("android-user", invalid))
+
+    assert sender.messages == [{"ok": False, "error": "invalid_envelope"}]
+    assert recipient.messages == []
+
+
 def test_bulk_relay_pairs_authenticated_peers_and_copies_exact_ciphertext(tmp_path: Path) -> None:
     async def scenario() -> None:
         relay = runtime(tmp_path)

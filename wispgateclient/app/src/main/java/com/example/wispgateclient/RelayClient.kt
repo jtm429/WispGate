@@ -1,6 +1,7 @@
 package com.example.wispgateclient
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +22,7 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.Socket
 import java.security.KeyFactory
+import java.security.MessageDigest
 import java.security.spec.X509EncodedKeySpec
 import java.util.UUID
 import javax.crypto.Cipher
@@ -50,6 +52,7 @@ class RelayClient(private val context: Context) {
     private val identity by lazy { EndpointIdentity().keyPair() }
     private val controlScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val interactiveMutex = Mutex()
+    private val peerSessions = mutableMapOf<String, PeerSession>()
     private var controlSocket: Socket? = null
     private var controlJob: Job? = null
     private val _catalogUpdates = MutableSharedFlow<List<Wisp>>(replay = 1, extraBufferCapacity = 1)
@@ -157,94 +160,92 @@ class RelayClient(private val context: Context) {
     }
 
     suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = interactiveMutex.withLock {
-        withContext(Dispatchers.IO) {
-        val token = preferences.getString("session_token", null) ?: error("Connect before requesting state")
-        Socket(info.host, info.relayPort).use { socket ->
-            socket.soTimeout = 10_000
-            val input = socket.reader()
-            val output = socket.writer()
-            send(output, JSONObject().put("type", "session").put("session_token", token).toString())
-            val ready = input.readJson("relay response")
-            if (!ready.optBoolean("ok")) error(ready.optString("error", "Relay session failed"))
-            val body = JSONObject()
-                .put("wisp_id", wisp.id)
-                .put("action", "state_request")
-            val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
-            send(output, envelope(wisp.owner, body, peerKey, advertisePublicKey = true))
-            val accepted = input.readJson("relay response")
-            if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Request rejected"))
-            val response = input.readJson("relay response")
-            val responseBody = decryptResponse(response, wisp.owner, peerKey)
-            WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
-        }
+        retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
+            withContext(Dispatchers.IO) {
+                val token = preferences.getString("session_token", null) ?: error("Connect before requesting state")
+                Socket(info.host, info.relayPort).use { socket ->
+                    socket.soTimeout = 10_000
+                    val input = socket.reader()
+                    val output = socket.writer()
+                    openRelaySession(input, output, token)
+                    val body = JSONObject().put("wisp_id", wisp.id).put("action", "state_request")
+                    val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
+                    val peerSession = sessionFor(wisp.owner, peerKey, input, output)
+                    val responseBody = exchangeSessionFrame(
+                        input, output, peerSession, body, "Request rejected", "Wisp state response",
+                    )
+                    WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
+                }
+            }
         }
     }
 
     suspend fun sendAction(info: ServerInfo, wisp: Wisp, action: String): WispState = interactiveMutex.withLock {
-        withContext(Dispatchers.IO) {
-        val token = preferences.getString("session_token", null) ?: error("Connect before sending action")
-        Socket(info.host, info.relayPort).use { socket ->
-            socket.soTimeout = 10_000
-            val input = socket.reader()
-            val output = socket.writer()
-            send(output, JSONObject().put("type", "session").put("session_token", token).toString())
-            val ready = input.readJson("relay response")
-            if (!ready.optBoolean("ok")) error(ready.optString("error", "Relay session failed"))
-            val body = JSONObject().put("wisp_id", wisp.id).put("action", "user_action").put("action_data", JSONObject(action))
-            val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
-            send(output, envelope(wisp.owner, body, peerKey, advertisePublicKey = false))
-            val accepted = input.readJson("relay response")
-            if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Action rejected"))
-            val response = input.readJson("relay response")
-            val responseBody = decryptResponse(response, wisp.owner, peerKey)
-            WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
-        }
+        retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
+            withContext(Dispatchers.IO) {
+                val token = preferences.getString("session_token", null) ?: error("Connect before sending action")
+                Socket(info.host, info.relayPort).use { socket ->
+                    socket.soTimeout = 10_000
+                    val input = socket.reader()
+                    val output = socket.writer()
+                    openRelaySession(input, output, token)
+                    val body = JSONObject().put("wisp_id", wisp.id).put("action", "user_action")
+                        .put("action_data", JSONObject(action))
+                    val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
+                    val peerSession = sessionFor(wisp.owner, peerKey, input, output)
+                    val responseBody = exchangeSessionFrame(
+                        input, output, peerSession, body, "Action rejected", "Wisp action response",
+                    )
+                    WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
+                }
+            }
         }
     }
 
     suspend fun sendFileAction(info: ServerInfo, wisp: Wisp, action: StagedFileAction): WispState = interactiveMutex.withLock {
-        withContext(Dispatchers.IO) {
-        Log.i("WispFileTransfer", "sending begin transfer=${action.transferId} files=${action.files.size}")
-        val token = preferences.getString("session_token", null) ?: error("Connect before sending an action")
-        Socket(info.host, info.relayPort).use { socket ->
-            socket.soTimeout = 10 * 60_000
-            val input = socket.reader()
-            val output = socket.writer()
-            send(output, JSONObject().put("type", "session").put("session_token", token).toString())
-            val ready = input.readJson("relay response")
-            if (!ready.optBoolean("ok")) error(ready.optString("error", "Relay session failed"))
-            val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
-            val prepared = BulkFileCrypto.prepare(
-                sender = "android-user",
-                recipient = wisp.owner,
-                transferId = action.transferId,
-                files = action.files,
-                recipientPublicKey = peerKey,
-            )
+        retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
+            withContext(Dispatchers.IO) {
+                Log.i("WispFileTransfer", "sending begin transfer=${action.transferId} files=${action.files.size}")
+                val token = preferences.getString("session_token", null) ?: error("Connect before sending an action")
+                Socket(info.host, info.relayPort).use { socket ->
+                    socket.soTimeout = 10 * 60_000
+                    val input = socket.reader()
+                    val output = socket.writer()
+                    openRelaySession(input, output, token)
+                    val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
+                    val peerSession = sessionFor(wisp.owner, peerKey, input, output)
+                    val prepared = BulkFileCrypto.prepare(
+                        sender = "android-user",
+                        recipient = wisp.owner,
+                        transferId = action.transferId,
+                        files = action.files,
+                        recipientPublicKey = peerKey,
+                    )
 
-            send(output, envelope(wisp.owner, FileActionProtocol.begin(wisp.id, action, prepared), peerKey, true))
-            val accepted = input.readJson("relay response")
-            if (!accepted.optBoolean("ok")) error(accepted.optString("error", "File action rejected"))
-            val begun = decryptResponse(input.readJson("encrypted Wisp response"), wisp.owner, peerKey)
-            val transferReady = begun.optJSONObject("transfer") ?: error("Wisp did not accept the file action")
-            if (transferReady.optString("type") == "error") error(transferReady.optString("error", "File action rejected"))
-            if (transferReady.optString("type") != "ready" || transferReady.optString("transfer_id") != action.transferId) {
-                error("Unexpected file-transfer response")
-            }
-            Log.i("WispFileTransfer", "Wisp ready transfer=${action.transferId} bulkFiles=${prepared.size}")
+                    val begun = exchangeSessionFrame(
+                        input, output, peerSession, FileActionProtocol.begin(wisp.id, action, prepared),
+                        "File action rejected", "encrypted Wisp response",
+                    )
+                    val transferReady = begun.optJSONObject("transfer") ?: error("Wisp did not accept the file action")
+                    if (transferReady.optString("type") == "error") error(transferReady.optString("error", "File action rejected"))
+                    if (transferReady.optString("type") != "ready" || transferReady.optString("transfer_id") != action.transferId) {
+                        error("Unexpected file-transfer response")
+                    }
+                    Log.i("WispFileTransfer", "Wisp ready transfer=${action.transferId} bulkFiles=${prepared.size}")
 
-            prepared.forEach { upload ->
-                BulkSocketTransport.send(info.host, info.bulkPort, wisp.owner, token, upload)
-                Log.i("WispFileTransfer", "bulk file sent id=${upload.file.id} bytes=${upload.file.size}")
-            }
+                    prepared.forEach { upload ->
+                        BulkSocketTransport.send(info.host, info.bulkPort, wisp.owner, token, upload)
+                        Log.i("WispFileTransfer", "bulk file sent id=${upload.file.id} bytes=${upload.file.size}")
+                    }
 
-            val completed = decryptResponse(input.readJson("encrypted Wisp completion"), wisp.owner, peerKey)
-            completed.optJSONObject("transfer")?.let { transfer ->
-                if (transfer.optString("type") == "error") error(transfer.optString("error", "File action failed"))
+                    val completed = readSessionResponse(input, peerSession, "encrypted Wisp completion")
+                    completed.optJSONObject("transfer")?.let { transfer ->
+                        if (transfer.optString("type") == "error") error(transfer.optString("error", "File action failed"))
+                    }
+                    Log.i("WispFileTransfer", "bulk action accepted transfer=${action.transferId}")
+                    WispState(wisp.id, completed.optJSONObject("response")?.optString("html", "") ?: "")
+                }
             }
-            Log.i("WispFileTransfer", "bulk action accepted transfer=${action.transferId}")
-            WispState(wisp.id, completed.optJSONObject("response")?.optString("html", "") ?: "")
-        }
         }
     }
 
@@ -264,23 +265,65 @@ class RelayClient(private val context: Context) {
         return JSONObject().put("type", "join").put("payload", encrypted).toString()
     }
 
-    private fun envelope(recipient: String, body: JSONObject, recipientPublicKey: String, advertisePublicKey: Boolean): String =
-        E2EEnvelope.encrypt(
-            sender = "android-user",
-            recipient = recipient,
-            messageId = UUID.randomUUID().toString(),
-            body = body,
-            recipientPublicKey = recipientPublicKey,
-            senderPrivateKey = identity.private,
-            senderPublicKey = identity.public,
-            advertiseSenderKey = advertisePublicKey,
-        ).toString()
+    private fun openRelaySession(input: BufferedReader, output: BufferedWriter, token: String) {
+        send(output, JSONObject().put("type", "session").put("session_token", token).toString())
+        val ready = input.readJson("relay response")
+        if (!ready.optBoolean("ok")) error(ready.optString("error", "Relay session failed"))
+    }
 
-    private fun decryptResponse(envelope: JSONObject, sender: String, senderPublicKey: String): JSONObject {
-        if (envelope.optString("sender") != sender || envelope.optString("recipient") != "android-user") {
-            throw SecurityException("Unexpected encrypted response route")
+    private fun exchangeSessionFrame(
+        input: BufferedReader,
+        output: BufferedWriter,
+        session: PeerSession,
+        body: JSONObject,
+        rejectionMessage: String,
+        responseStage: String,
+    ): JSONObject {
+        try {
+            send(output, session.encrypt(body, SystemClock.elapsedRealtime()).toString())
+        } catch (cause: Exception) {
+            throw PeerSessionFailure("Could not send peer-session frame", cause)
         }
-        return E2EEnvelope.decrypt(envelope, identity.private, senderPublicKey).body
+        val accepted = try {
+            input.readJson("relay response")
+        } catch (cause: Exception) {
+            throw PeerSessionFailure("Relay closed while accepting peer-session frame", cause)
+        }
+        if (!accepted.optBoolean("ok")) error(accepted.optString("error", rejectionMessage))
+        return readSessionResponse(input, session, responseStage)
+    }
+
+    private fun readSessionResponse(input: BufferedReader, session: PeerSession, stage: String): JSONObject =
+        try {
+            session.decrypt(input.readJson(stage), SystemClock.elapsedRealtime())
+        } catch (cause: Exception) {
+            throw PeerSessionFailure("Peer session failed while waiting for $stage", cause)
+        }
+
+    private fun invalidatePeerSession(owner: String) {
+        peerSessions.keys.removeAll { it.startsWith("$owner:") }
+    }
+
+    private fun sessionFor(
+        owner: String,
+        peerPublicKey: String,
+        input: BufferedReader,
+        output: BufferedWriter,
+    ): PeerSession {
+        val fingerprint = MessageDigest.getInstance("SHA-256")
+            .digest(SessionCrypto.decode64(peerPublicKey)).joinToString("") { "%02x".format(it) }
+        val cacheKey = "$owner:$fingerprint"
+        val now = SystemClock.elapsedRealtime()
+        peerSessions[cacheKey]?.takeUnless { it.isExpired(now) }?.let { return it }
+        peerSessions.keys.removeAll { it.startsWith("$owner:") }
+        val pending = SessionHandshake.begin(owner, peerPublicKey, identity, now)
+        send(output, pending.envelope.toString())
+        val accepted = input.readJson("session handshake relay acceptance")
+        if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Session handshake rejected"))
+        val acceptance = input.readJson("authenticated Wisp session acceptance")
+        return SessionHandshake.finish(pending, acceptance, SystemClock.elapsedRealtime()).also {
+            peerSessions[cacheKey] = it
+        }
     }
 
     private fun trustedPeerKey(owner: String, advertisedKey: String): String {

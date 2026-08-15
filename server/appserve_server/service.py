@@ -160,7 +160,7 @@ class RelayRuntime:
             LOG.info("relay connected: %s from %s", client_id, peer)
             while line := await reader.readline():
                 message = json.loads(line)
-                if message.get("type") != "envelope":
+                if message.get("type") not in {"envelope", "session_envelope"}:
                     await send_json(writer, {"ok": False, "error": "invalid_envelope"})
                     continue
                 await self.forward(client_id, message)
@@ -274,12 +274,27 @@ class RelayRuntime:
 
     async def forward(self, sender: str, envelope: dict[str, Any]) -> None:
         recipient = envelope.get("recipient")
-        required = {"version", "type", "sender", "recipient", "message_id", "algorithm", "encrypted_key", "nonce", "ciphertext", "signature"}
-        allowed = required | {"sender_public_key"}
+        if envelope.get("type") == "session_envelope":
+            required = {"version", "type", "session_id", "sender", "recipient", "sequence", "ciphertext"}
+            allowed = required
+            valid_shape = (
+                envelope.get("version") == 1
+                and isinstance(envelope.get("session_id"), str) and bool(envelope.get("session_id"))
+                and isinstance(envelope.get("sequence"), int) and not isinstance(envelope.get("sequence"), bool)
+                and envelope.get("sequence") >= 0
+                and envelope.get("sequence") < (1 << 64)
+                and isinstance(envelope.get("ciphertext"), str)
+                and 0 < len(envelope.get("ciphertext")) <= 1024 * 1024
+            )
+        else:
+            required = {"version", "type", "sender", "recipient", "message_id", "algorithm", "encrypted_key", "nonce", "ciphertext", "signature"}
+            allowed = required | {"sender_public_key"}
+            valid_shape = envelope.get("type") == "envelope"
+
         if (
             not recipient
             or envelope.get("sender") != sender
-            or envelope.get("type") != "envelope"
+            or not valid_shape
             or not set(envelope).issubset(allowed)
             or not required.issubset(envelope)
         ):
@@ -294,7 +309,13 @@ class RelayRuntime:
             # the relay acceptance before the recipient's application reply.
             # Send this first so a fast Wisp response cannot race it.
             if source:
-                await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
+                if envelope.get("type") == "session_envelope":
+                    await send_json(source[1], {
+                        "ok": True, "type": "accepted", "session_id": envelope.get("session_id"),
+                        "sequence": envelope.get("sequence"),
+                    })
+                else:
+                    await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
             await send_json(destination[1], envelope)
         else:
             if source:

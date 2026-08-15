@@ -2,7 +2,7 @@
 
 ## Status
 
-Version 1 uses explicit JSON message envelopes over persistent relay sockets. Application payloads are encrypted and signed by the endpoint runtimes before they are sent to the relay.
+Version 1 uses explicit JSON message envelopes over relay sockets. Long-term RSA identities authenticate a one-time peer-session handshake; ordinary application payloads then use compact symmetric session envelopes. Endpoint runtimes encrypt all application data before it reaches the relay.
 
 ## Two encryption layers
 
@@ -14,28 +14,36 @@ The relay's public bootstrap key is used only to protect the first join message.
 ## Version 1 cryptographic shape
 
 - Client identity: persistent 3072-bit RSA key pair.
-- Payload encryption: fresh AES-256-GCM key and 96-bit nonce per message.
-- Content-key wrapping: RSA-OAEP with SHA-256 and MGF1-SHA-1, matching Android Keystore's persisted-key authorization and the standard Android OAEP provider behavior.
-- Sender authentication: RSA-PSS with SHA-256 and a 32-byte salt.
+- RSA handshake-envelope payload encryption: fresh AES-256-GCM key and 96-bit nonce per envelope.
+- Handshake content-key wrapping: RSA-OAEP with SHA-256 and MGF1-SHA-1, matching Android's standard OAEP provider behavior.
+- Handshake sender authentication: RSA-PSS with SHA-256 and a 32-byte salt.
+- Session payload encryption: AES-256-GCM under separate HKDF-SHA-256 keys for Android-to-Wisp and Wisp-to-Android traffic.
 - Randomness: operating-system CSPRNG.
 - Public-key bootstrap: a maintained hybrid-encryption implementation such as HPKE, if available for the selected language.
 
-All binary fields use unpadded base64url. The authenticated routing metadata is canonical JSON containing `algorithm`, `message_id`, `recipient`, `sender`, `type`, and `version`. The relay rejects application envelopes containing a plaintext `body` field.
+All binary fields use unpadded base64url. RSA-envelope authenticated routing metadata is canonical JSON containing `algorithm`, `message_id`, `recipient`, `sender`, `type`, and `version`. Session-envelope routing metadata is also AES-GCM additional authenticated data. The relay rejects envelopes containing a plaintext `body` field or any field outside the schema for that envelope type.
 
 ## Session establishment
 
-For a first implementation:
+The implemented peer handshake is:
 
 ```text
-1. Client generates/loads a long-term identity key.
-2. Client encrypts a fresh bootstrap payload to the pinned relay public key.
-3. Relay decrypts it and sends a nonce challenge.
-4. Client signs the challenge and transcript with its identity key.
-5. Relay verifies the signature and returns a session record.
-6. Clients establish or refresh a per-peer E2E session key.
+1. Each endpoint generates or loads a persistent 3072-bit RSA identity. Android retains its identity in the platform-backed endpoint identity store; the Python Wisp retains its identity beside its configuration. Both endpoints retain the peer RSA public key using trust on first use and reject substitutions.
+2. Android creates a random 32-byte master secret, session ID, and challenge. It sends a signed RSA `envelope` whose encrypted body is `session_init` with those values and advertises its identity public key.
+3. The Wisp verifies the RSA signature and pinned identity, decrypts the init, and derives two 32-byte keys with HKDF-SHA-256. The session ID bytes are the salt; the info labels are `wispgate-session-v1/android-to-wisp` and `wispgate-session-v1/wisp-to-android`.
+4. The Wisp returns a signed RSA `envelope` containing `session_accept`, the session ID and challenge, and an HMAC-SHA-256 proof under the Wisp-to-Android key over the NUL-separated acceptance transcript.
+5. Android verifies the Wisp's pinned RSA identity, route, challenge, session ID, proof, and handshake lifetime. Both sides then keep only the in-memory peer session for application traffic.
 ```
 
-The session transcript includes protocol version, deployment ID, both client IDs, and key fingerprints to prevent cross-deployment and downgrade confusion.
+RSA identity keys remain the authentication root; session keys and master secrets are never persisted or exposed to the relay. A peer session has a 30-minute absolute lifetime measured from local establishment time. It is not extended by activity. Expiration, an unknown session, an invalid authentication tag, or an unexpected/replayed sequence invalidates that peer session. Android may invalidate and establish a fresh session once for the interrupted operation; ordinary application errors are not retried. A bad session frame is discarded by the Wisp without closing its persistent relay connection, so a fresh RSA handshake can follow on that connection.
+
+After establishment, each application frame has only these relay-visible fields:
+
+```json
+{"version":1,"type":"session_envelope","session_id":"...","sender":"android-user","recipient":"prime-wisp","sequence":0,"ciphertext":"..."}
+```
+
+Each direction has its own key and monotonically increasing sequence starting at zero. The 96-bit AES-GCM nonce is the fixed four-byte prefix `57 47 01 00` followed by the unsigned 64-bit sequence in network byte order. The complete routing object (`version`, `type`, `session_id`, `sender`, `recipient`, and `sequence`) is canonical JSON AAD. Receivers require the exact next sequence, so missing, reordered, replayed, out-of-range, route-modified, or tag-modified frames fail closed.
 
 ## Turn-based applet messages
 
@@ -64,27 +72,23 @@ When a Wisp client joins, it registers its manifest:
 }
 ```
 
-The relay persists the catalog metadata and returns it to user clients during join. Each item carries its Wisp owner's public key so the Android endpoint can encrypt the first request before sending it. The user client can display the list without knowing anything about the Wisp's UI.
+The relay persists the catalog metadata and returns it to user clients during join. Each item carries its Wisp owner's public key so Android can authenticate and encrypt the peer-session handshake before sending application traffic. The user client can display the list without knowing anything about the Wisp's UI.
 
-Selecting a Wisp sends a generic, non-mutating state request:
+Selecting a Wisp establishes a peer session when one is not already live, then sends a generic, non-mutating state request:
 
 ```json
 {
   "version": 1,
-  "type": "envelope",
+  "type": "session_envelope",
+  "session_id": "...",
   "sender": "android-user",
   "recipient": "prime-wisp",
-  "message_id": "...",
-  "algorithm": "RSA-OAEP-256+A256GCM+PS256",
-  "encrypted_key": "...",
-  "nonce": "...",
-  "ciphertext": "...",
-  "signature": "...",
-  "sender_public_key": "base64url-DER"
+  "sequence": 0,
+  "ciphertext": "..."
 }
 ```
 
-The ciphertext decrypts at the Wisp to `{"wisp_id":"prime","action":"state_request"}`. The first refresh advertises Android's public key so the Wisp can authenticate the request and encrypt its response directly to Android. The Wisp pins that key on first use and rejects later substitutions. It responds with its current complete UI/state; this request must not advance the Wisp's turn or invoke its ordinary action handler. Other UI events are encrypted applet-defined actions and may advance the turn.
+The ciphertext decrypts at the Wisp to `{"wisp_id":"prime","action":"state_request"}`. The preceding RSA session handshake advertises Android's public key; the Wisp pins that key on first use and rejects later substitutions. It responds with its current complete UI/state in the opposite-direction session envelope. This request must not advance the Wisp's turn or invoke its ordinary action handler. Other UI events use the same session and may advance the turn.
 
 An Android host keeps its control connection open after catalog registration. When a Wisp registers or disconnects, the relay pushes:
 
@@ -108,26 +112,25 @@ The request is accepted only after the Android client has completed the relay's 
 
 The relay persists client registration records and the information needed to attempt reconnection after an Azure VM restart. On startup it loads that state and tries to re-establish sessions with clients previously connected to the deployment.
 
-Reconnection never restores trust merely from an old session token. Each client performs a fresh authenticated handshake using its identity key. Existing end-to-end keys may be resumed only if their local key-state rules permit it; otherwise the clients perform a new key exchange.
+Reconnection never restores trust merely from an old relay session token. Long-term RSA identity trust is retained, but peer-session secrets are in-memory; after an endpoint reconnect they perform a new authenticated peer handshake.
 
-Message resumption uses acknowledged message IDs and application-level idempotency. A relay restart must not cause a client to treat a relay acceptance acknowledgement as proof that the recipient processed a message.
+Peer sessions are in-memory and are re-established after relay or endpoint reconnection. Application-level operations that need retry safety remain responsible for idempotency. A relay restart must not cause a client to treat a relay acceptance acknowledgement as proof that the recipient processed a frame.
 
 ## Message guarantees
 
-Every application message has:
+Every symmetric application frame has:
 
-- unique message ID;
+- a peer-session ID;
 - sender and recipient IDs;
-- creation time and expiry;
-- monotonically increasing sender sequence, where practical;
+- an absolute lifetime inherited from its in-memory session;
+- an exact monotonically increasing directional sequence;
 - authenticated ciphertext;
-- optional reply-to ID.
 
-Receivers deduplicate message IDs. Retries are safe. The relay's acknowledgement means only “accepted for forwarding/queueing.”
+Receivers reject any sequence other than the exact next value. The relay's acknowledgement means only “accepted for forwarding”; it is not proof that the recipient authenticated or processed the frame.
 
 ## Key distribution
 
-The relay distributes Wisp public keys in catalog entries. Android includes its public key on each state-refresh envelope, including the first click. Both endpoints persist a trust-on-first-use record and reject a later key substitution. Public keys and routing metadata remain visible to the relay; decrypted application bodies do not.
+The relay distributes Wisp public keys in catalog entries. Android advertises its public key in each RSA `session_init` handshake. Both endpoints retain a trust-on-first-use record and reject a later key substitution. Public keys, session IDs, sequences, and routing metadata remain visible to the relay; master secrets, session keys, and decrypted application bodies do not.
 
 ## Threat model
 
@@ -160,19 +163,16 @@ upload.addEventListener("submit", event => {
 </script>
 ```
 
-The runtime collects ordinary form values, stages selected browser `File` objects in bounded chunks, and sends this encrypted sequence:
+The runtime collects ordinary form values, stages selected browser `File` objects, and uses the established peer session for the encrypted control sequence:
 
 ```text
-file_begin(manifest with file IDs, fields, names, MIME types, and exact lengths)
-  <- ready(accepted transfer ID and maximum chunk size)
-file_chunk(file ID, exact offset, encrypted bytes)
-  <- chunk_accepted(next exact offset)
-...
-file_commit(transfer ID)
-  <- complete Wisp HTML response
+session_envelope(file_begin with manifests and one-time bulk tickets)
+  <- session_envelope(ready with accepted transfer ID)
+dedicated bulk TCP connection(s) carry opaque file ciphertext
+  <- session_envelope(final complete/error and Wisp HTML response)
 ```
 
-Each message is a separately authenticated endpoint-encrypted envelope. The relay sees routing metadata and ciphertext sizes but not action fields, filenames, MIME types, or file contents. The Python runtime rejects duplicate IDs, unexpected offsets, undeclared bytes, incomplete commits, more than 32 files, or more than 256 MiB in one action. The current chunk size is 24 KiB so each encrypted line remains below the transport's bounded reader limit.
+`file_begin`, Wisp readiness, and the final response are ordinary `session_envelope` control bodies. They do not fall back to per-message RSA envelopes. Each file uses a dedicated TCP connection to the bulk port, authenticated to the relay with the endpoint's relay session token and paired by a bounded one-time ticket from the encrypted manifest. A fresh per-file AES-256-GCM key is RSA-wrapped to the Wisp; the relay copies exactly the declared opaque ciphertext length and never receives plaintext file metadata or contents. Bulk ciphertext is therefore related to, but not carried inside, the symmetric peer-session stream. The Python runtime rejects malformed or duplicate manifests/tickets, undeclared lengths, incomplete authenticated ciphertext, more than 32 files, or more than 256 MiB in one action.
 
 The existing Python action callback remains dictionary-compatible. File-aware callbacks inspect `action.files`; one file for a form field is an `UploadedFile`, while repeated files for one field are a tuple:
 

@@ -17,11 +17,14 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .e2e import (
+    PeerSession,
     decrypt_envelope,
+    derive_session_keys,
     encrypt_envelope,
     generate_identity,
     load_or_create_identity,
     public_key_text,
+    session_accept_proof,
 )
 
 
@@ -126,6 +129,7 @@ class AppserveClient:
         self._transfer_directory = Path(transfer_directory) if transfer_directory else Path(tempfile.gettempdir()) / "wispgate-transfers"
         self._transfers: dict[tuple[str, str], _IncomingTransfer] = {}
         self._peer_keys: dict[str, str] = {}
+        self._peer_sessions: dict[str, PeerSession] = {}
         self._send_lock = asyncio.Lock()
         if self._peer_store_path and self._peer_store_path.exists():
             stored = json.loads(self._peer_store_path.read_text(encoding="utf-8"))
@@ -181,6 +185,7 @@ class AppserveClient:
         writer = self._writer
         self._reader = self._writer = None
         self._session_token = None
+        self._peer_sessions.clear()
         if writer is not None:
             writer.close()
             try:
@@ -201,6 +206,7 @@ class AppserveClient:
             self._writer.close()
         self._reader = self._writer = None
         self._session_token = None
+        self._peer_sessions.clear()
         for transfer in list(self._transfers.values()):
             if transfer.task is not None:
                 transfer.task.cancel()
@@ -212,9 +218,13 @@ class AppserveClient:
         assert self._reader is not None
         while line := await self._reader.readline():
             message = json.loads(line)
-            if message.get("type") != "envelope":
-                continue
-            await self._handle_envelope(message)
+            if message.get("type") == "envelope":
+                await self._handle_envelope(message)
+            elif message.get("type") == "session_envelope":
+                try:
+                    await self._handle_session_envelope(message)
+                except ValueError as cause:
+                    LOG.warning("discarding invalid peer-session frame: %s", cause)
 
     def peer_public_key(self, client_id: str) -> str | None:
         return self._peer_keys.get(client_id)
@@ -241,8 +251,42 @@ class AppserveClient:
 
     async def _handle_envelope(self, message: dict[str, Any]) -> None:
         sender = message["sender"]
+        if message.get("recipient") != self.client_id:
+            raise ValueError("invalid handshake route")
         body, sender_key = decrypt_envelope(message, self._identity_key, self._peer_keys.get(sender))
         self._remember_peer(sender, sender_key)
+        if body.get("type") != "session_init":
+            raise ValueError("RSA envelope must contain session_init")
+        session_id = body.get("session_id")
+        challenge = body.get("challenge")
+        encoded_master = body.get("master_secret")
+        if not all(isinstance(value, str) and value for value in (session_id, challenge, encoded_master)):
+            raise ValueError("invalid session_init")
+        master = base64.urlsafe_b64decode(encoded_master + "=" * (-len(encoded_master) % 4))
+        if len(master) != 32:
+            raise ValueError("invalid session master secret")
+        android_to_wisp, wisp_to_android = derive_session_keys(master, session_id)
+        self._peer_sessions[sender] = PeerSession(
+            session_id, self.client_id, sender, android_to_wisp, wisp_to_android, created_at=time.monotonic()
+        )
+        await self._send_envelope(sender, {
+            "type": "session_accept", "session_id": session_id, "challenge": challenge,
+            "proof": session_accept_proof(master, session_id, challenge, sender, self.client_id),
+        })
+
+    async def _handle_session_envelope(self, message: dict[str, Any]) -> None:
+        sender = message.get("sender")
+        session = self._peer_sessions.get(sender)
+        if session is None:
+            raise ValueError("unknown session")
+        try:
+            body = session.decrypt(message, now=time.monotonic())
+        except Exception as cause:
+            self._peer_sessions.pop(sender, None)
+            raise ValueError(str(cause)) from cause
+        await self._dispatch_session_body(sender, body)
+
+    async def _dispatch_session_body(self, sender: str, body: dict[str, Any]) -> None:
         self._expire_file_transfers()
         wisp = self._wisps.get(body.get("wisp_id"))
         if not wisp:
@@ -264,7 +308,7 @@ class AppserveClient:
                     "transfer_id": transfer_id,
                     "error": str(cause),
                 })
-            await self._send_envelope(sender, response)
+            await self._send_session(sender, response)
             transfer = self._transfers.get((sender, transfer_id))
             if transfer is not None:
                 transfer.task = asyncio.create_task(self._receive_bulk_transfer(transfer_id, transfer))
@@ -273,7 +317,7 @@ class AppserveClient:
             result = wisp.action(WispAction(body.get("action_data", {})))
             state = await result if asyncio.iscoroutine(result) else result
             response = {"wisp_id": wisp.id, "response": state}
-        await self._send_envelope(sender, response)
+        await self._send_session(sender, response)
 
     def _transfer_response(self, wisp: Wisp, transfer: dict[str, Any]) -> dict[str, Any]:
         return {"wisp_id": wisp.id, "transfer": transfer}
@@ -376,7 +420,7 @@ class AppserveClient:
                     "transfer_id": transfer_id,
                     "error": str(cause),
                 })
-            await self._send_envelope(transfer.sender, response)
+            await self._send_session(transfer.sender, response)
         finally:
             self._transfers.pop(key, None)
             self._cleanup_transfer(transfer)
@@ -467,6 +511,14 @@ class AppserveClient:
                     sender_private_key=self._identity_key,
                 ),
             )
+
+    async def _send_session(self, recipient: str, body: dict[str, Any]) -> None:
+        assert self._writer is not None
+        session = self._peer_sessions.get(recipient)
+        if session is None:
+            raise ValueError(f"no active session for {recipient}")
+        async with self._send_lock:
+            await self._send(self._writer, session.encrypt(body, now=time.monotonic()))
 
     def _bootstrap_payload(self) -> str:
         key = serialization.load_der_public_key(self.info.server_public_key)

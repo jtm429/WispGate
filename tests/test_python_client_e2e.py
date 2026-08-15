@@ -6,7 +6,13 @@ import json
 from pathlib import Path
 
 from appserve.client import AppserveClient, ServerInfo, Wisp, WispAction
-from appserve.e2e import decrypt_envelope, encrypt_envelope, generate_identity, public_key_text
+from appserve.e2e import (
+    PeerSession,
+    derive_session_keys,
+    encrypt_envelope,
+    generate_identity,
+    public_key_text,
+)
 from server.appserve_server.core import RelayConfig, generate_server_keypair
 
 
@@ -25,6 +31,35 @@ class RecordingWriter:
 
     async def wait_closed(self) -> None:
         pass
+
+
+async def establish_peer_session(client: AppserveClient, android_identity, wisp_identity) -> PeerSession:
+    master = bytes(range(32))
+    session_id = "test-session"
+    request = encrypt_envelope(
+        sender="android-user",
+        recipient=client.client_id,
+        message_id="session-init",
+        body={
+            "type": "session_init",
+            "session_id": session_id,
+            "challenge": "test-challenge",
+            "master_secret": base64.urlsafe_b64encode(master).decode().rstrip("="),
+        },
+        recipient_public_key=public_key_text(wisp_identity),
+        sender_private_key=android_identity,
+        advertise_sender_key=True,
+    )
+    await client._handle_envelope(request)
+    android_to_wisp, wisp_to_android = derive_session_keys(master, session_id)
+    return PeerSession(
+        session_id,
+        "android-user",
+        client.client_id,
+        android_to_wisp,
+        wisp_to_android,
+        created_at=client._peer_sessions["android-user"].created_at,
+    )
 
 
 def test_public_package_exports_reusable_file_action_types() -> None:
@@ -70,24 +105,28 @@ def test_python_wisp_decrypts_first_refresh_and_encrypts_response(tmp_path: Path
     )
     writer = RecordingWriter()
     client._writer = writer  # type: ignore[assignment]
-    request = encrypt_envelope(
-        sender="android-user",
-        recipient="prime-wisp",
-        message_id="request-1",
-        body={"wisp_id": "prime", "action": "state_request"},
-        recipient_public_key=public_key_text(wisp_identity),
-        sender_private_key=android,
-        advertise_sender_key=True,
-    )
+    async def scenario() -> dict:
+        session = await establish_peer_session(client, android, wisp_identity)
+        request = session.encrypt(
+            {"wisp_id": "prime", "action": "state_request"},
+            now=client._peer_sessions["android-user"].created_at + 1,
+        )
+        await client._handle_session_envelope(request)
+        return session.decrypt(
+            writer.messages[1],
+            now=client._peer_sessions["android-user"].created_at + 1,
+        )
 
-    asyncio.run(client._handle_envelope(request))
+    body = asyncio.run(scenario())
 
     assert client.peer_public_key("android-user") == public_key_text(android)
-    assert len(writer.messages) == 1
-    response = writer.messages[0]
+    assert len(writer.messages) == 2
+    response = writer.messages[1]
+    assert response["type"] == "session_envelope"
     assert "body" not in response
     assert "secret state" not in str(response)
-    body, _ = decrypt_envelope(response, android, public_key_text(wisp_identity))
+    assert "encrypted_key" not in response
+    assert "signature" not in response
     assert body == {"wisp_id": "prime", "response": {"html": "<p>secret state</p>"}}
 
 
@@ -142,11 +181,9 @@ def test_encrypted_bulk_file_invokes_generic_wisp_action(tmp_path: Path) -> None
         client.register(Wisp("upload", "Upload", "", state=lambda: {"html": ""}, action=handle))
         writer = RecordingWriter()
         client._writer = writer  # type: ignore[assignment]
-        request = encrypt_envelope(
-            sender="android-user",
-            recipient="upload-wisp",
-            message_id="request-1",
-            body={
+        android_session = await establish_peer_session(client, android, wisp_identity)
+        request = android_session.encrypt(
+            {
                 "wisp_id": "upload",
                 "action": "file_begin",
                 "transfer_id": "transfer-1",
@@ -166,23 +203,26 @@ def test_encrypted_bulk_file_invokes_generic_wisp_action(tmp_path: Path) -> None
                     },
                 }],
             },
-            recipient_public_key=public_key_text(wisp_identity),
-            sender_private_key=android,
-            advertise_sender_key=True,
+            now=client._peer_sessions["android-user"].created_at + 1,
         )
-        await client._handle_envelope(request)
-        ready, _ = decrypt_envelope(writer.messages[0], android, public_key_text(wisp_identity))
+        await client._handle_session_envelope(request)
+        ready = android_session.decrypt(
+            writer.messages[1], now=client._peer_sessions["android-user"].created_at + 1,
+        )
+
         assert ready["transfer"] == {"type": "ready", "transfer_id": "transfer-1"}
         for _ in range(100):
-            if len(writer.messages) == 2:
+            if len(writer.messages) == 3:
                 break
             await asyncio.sleep(0.01)
-        if len(writer.messages) != 2:
+        if len(writer.messages) != 3:
             transfer = client._transfers.get(("android-user", "transfer-1"))
             task = transfer.task if transfer else None
             detail = task.exception() if task and task.done() and not task.cancelled() else None
             raise AssertionError(f"bulk completion missing; header={received_header!r} task={detail!r}")
-        complete, _ = decrypt_envelope(writer.messages[1], android, public_key_text(wisp_identity))
+        complete = android_session.decrypt(
+            writer.messages[2], now=client._peer_sessions["android-user"].created_at + 1,
+        )
         await client.close()
         server.close()
         await server.wait_closed()
