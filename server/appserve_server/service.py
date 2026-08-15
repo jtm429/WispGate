@@ -316,7 +316,20 @@ class RelayRuntime:
                     })
                 else:
                     await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
-            await send_json(destination[1], envelope)
+            try:
+                await send_json(destination[1], envelope)
+            except (ConnectionError, OSError) as exc:
+                LOG.info("relay destination disconnected while forwarding %s -> %s: %s", sender, recipient, exc)
+                if self.sessions.get(recipient, (None, None))[1] is destination[1]:
+                    self.sessions.pop(recipient, None)
+                    self.state.remove_wisps_for_owner(recipient)
+                    self.state.save()
+                    await self.broadcast_catalog()
+                destination[1].close()
+                try:
+                    await destination[1].wait_closed()
+                except (ConnectionError, OSError):
+                    pass
         else:
             if source:
                 await send_json(source[1], {"ok": False, "error": "recipient_offline"})

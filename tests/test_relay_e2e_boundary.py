@@ -20,6 +20,21 @@ class RecordingWriter:
         pass
 
 
+class DisconnectedWriter(RecordingWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+
+    async def drain(self) -> None:
+        raise ConnectionResetError("recipient disconnected")
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
 def runtime(tmp_path: Path) -> RelayRuntime:
     return RelayRuntime(RelayConfig(b""), RelayState(tmp_path / "state.json"))
 
@@ -133,6 +148,25 @@ def test_relay_routes_opaque_session_envelope_after_acceptance(tmp_path: Path) -
     assert sender.messages == [{"ok": True, "type": "accepted", "session_id": "s1", "sequence": 0}]
     assert recipient.messages == [envelope]
     assert "master_secret" not in str(recipient.messages)
+
+
+def test_destination_write_failure_does_not_terminate_source_session(tmp_path: Path) -> None:
+    relay = runtime(tmp_path)
+    source = RecordingWriter()
+    destination = DisconnectedWriter()
+    relay.sessions["collector-wisp"] = ("wisp-token", source)  # type: ignore[assignment]
+    relay.sessions["android-user"] = ("android-token", destination)  # type: ignore[assignment]
+    envelope = {
+        "version": 1, "type": "session_envelope", "session_id": "s1",
+        "sender": "collector-wisp", "recipient": "android-user", "sequence": 0,
+        "ciphertext": "opaque-final-response",
+    }
+
+    asyncio.run(relay.forward("collector-wisp", envelope))
+
+    assert relay.sessions["collector-wisp"] == ("wisp-token", source)
+    assert "android-user" not in relay.sessions
+    assert destination.closed
 
 
 def test_relay_rejects_session_plaintext_spoofing_and_unknown_fields(tmp_path: Path) -> None:
