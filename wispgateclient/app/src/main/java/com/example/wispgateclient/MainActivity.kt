@@ -79,6 +79,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun WispGateApp(client: RelayClient) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var server by remember { mutableStateOf(client.savedServer()) }
     var wisps by remember { mutableStateOf<List<RelayClient.Wisp>>(emptyList()) }
@@ -91,11 +92,20 @@ private fun WispGateApp(client: RelayClient) {
     var updatingServer by remember { mutableStateOf(false) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
 
+    LaunchedEffect(Unit) {
+        BulkTransferService.results.collect { result ->
+            if (selected?.id != result.wispId) return@collect
+            result.html?.let { html = it }
+            result.error?.let { error = it }
+        }
+    }
 
     if (server == null) {
         SetupScreen(
-            onSave = { host, key, controlPort, relayPort ->
-                val info = RelayClient.ServerInfo(host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt())
+            onSave = { host, key, controlPort, relayPort, bulkPort ->
+                val info = RelayClient.ServerInfo(
+                    host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt(), bulkPort.toInt(),
+                )
                 client.saveServer(info)
                 server = info
             },
@@ -149,16 +159,15 @@ private fun WispGateApp(client: RelayClient) {
             },
             onFileAction = { action ->
                 Log.i("WispFileTransfer", "native upload queued transfer=${action.transferId} files=${action.files.size}")
-                val upload = scope.launch {
-                    try {
-                        html = client.sendFileAction(server!!, selected!!, action).html
-                        Log.i("WispFileTransfer", "native upload completed transfer=${action.transferId}")
-                    } catch (cause: Throwable) {
-                        Log.e("WispFileTransfer", "native upload failed transfer=${action.transferId}", cause)
-                        error = cause.message ?: "Unable to send Wisp file action"
-                    }
+                try {
+                    BulkTransferService.enqueue(
+                        context,
+                        BulkTransferJob(server!!, selected!!, action),
+                    )
+                } catch (cause: Throwable) {
+                    Log.e("WispFileTransfer", "unable to queue transfer=${action.transferId}", cause)
+                    error = cause.message ?: "Unable to queue Wisp file action"
                 }
-                upload.invokeOnCompletion { action.cleanup() }
             },
             onBack = { selected = null; html = null },
         )
@@ -269,11 +278,12 @@ private fun WispGateApp(client: RelayClient) {
 }
 
 @Composable
-private fun SetupScreen(onSave: (String, String, String, String) -> Unit) {
+private fun SetupScreen(onSave: (String, String, String, String, String) -> Unit) {
     var host by remember { mutableStateOf("") }
     var key by remember { mutableStateOf("") }
     var controlPort by remember { mutableStateOf("443") }
     var relayPort by remember { mutableStateOf("4443") }
+    var bulkPort by remember { mutableStateOf("4444") }
     Column(
         Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
         verticalArrangement = Arrangement.Center,
@@ -288,8 +298,14 @@ private fun SetupScreen(onSave: (String, String, String, String) -> Unit) {
         OutlinedTextField(controlPort, { controlPort = it }, label = { Text("Control port") }, singleLine = true)
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(relayPort, { relayPort = it }, label = { Text("Relay port") }, singleLine = true)
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(bulkPort, { bulkPort = it }, label = { Text("Bulk port") }, singleLine = true)
         Spacer(Modifier.height(20.dp))
-        Button(enabled = host.isNotBlank() && key.isNotBlank() && controlPort.toIntOrNull() != null && relayPort.toIntOrNull() != null, onClick = { onSave(host, key, controlPort, relayPort) }) {
+        Button(
+            enabled = host.isNotBlank() && key.isNotBlank() && controlPort.toIntOrNull() != null &&
+                relayPort.toIntOrNull() != null && bulkPort.toIntOrNull() != null,
+            onClick = { onSave(host, key, controlPort, relayPort, bulkPort) },
+        ) {
             Text("Save and connect")
         }
     }

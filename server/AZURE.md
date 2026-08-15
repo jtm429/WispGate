@@ -10,7 +10,7 @@ In the Azure portal:
 2. Use SSH public-key authentication.
 3. Give it a static public IP or a stable DNS name.
 4. Do not enable password login.
-5. Create inbound network-security-group rules for TCP `443` and `4443`, restricted to the source IP ranges you actually need. Keep SSH (`22`) restricted to your own IP.
+5. Create inbound network-security-group rules for TCP `443`, `4443`, and `4444`, restricted to the source IP ranges you actually need. Keep SSH (`22`) restricted to your own IP.
 6. Record the public DNS name or IP.
 
 The relay clients initiate outbound connections; only the Azure VM needs public inbound ports.
@@ -88,11 +88,11 @@ After this one-time setup, the app's `Update server from GitHub` button can perf
 From the VM:
 
 ```bash
-sudo ss -ltnp | grep -E ':443|:4443'
+sudo ss -ltnp | grep -E ':443|:4443|:4444'
 sudo systemctl is-active wispgate-relay
 ```
 
-The service is ready when both ports are listening and `systemctl is-active` prints `active`.
+The service is ready when all three ports are listening and `systemctl is-active` prints `active`.
 
 ## 8. Stopping and starting to save money
 
@@ -112,10 +112,10 @@ The relay state file and private key are in `/var/lib/wispgate`, so they survive
 
 ## Current MVP limitations
 
-- The current service uses newline-delimited JSON over two asyncio TCP ports.
+- The current service uses newline-delimited JSON on the control and relay ports plus an authenticated raw-ciphertext bulk port.
 - The bootstrap payload is encrypted to the relay RSA public key.
 - Application envelopes contain only authenticated routing metadata, wrapped content keys, nonces, signatures, optional public-key advertisements, and opaque ciphertext. The relay rejects plaintext application `body` fields and cannot decrypt Wisp state or actions.
-- The sockets are currently plaintext TCP. Before public deployment, add TLS termination in front of both ports or wire `ssl.SSLContext` into `asyncio.start_server`.
+- The sockets are currently plaintext TCP. Before public deployment, add TLS termination in front of all three ports or wire `ssl.SSLContext` into `asyncio.start_server`.
 - The relay startup reconnect behavior is represented in the protocol design, but direct relay-initiated NAT reconnection requires a future transport implementation. Clients' reconnect loops work with this MVP.
 
 Do not expose the current MVP directly to the public internet until TLS and the remaining client authentication/session work are implemented.

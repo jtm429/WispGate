@@ -39,6 +39,7 @@ class RelayClient(private val context: Context) {
         val publicKey: String,
         val controlPort: Int = 443,
         val relayPort: Int = 4443,
+        val bulkPort: Int = 4444,
     )
     data class Wisp(val id: String, val name: String, val description: String, val owner: String, val publicKey: String)
     data class WispState(val wispId: String, val html: String)
@@ -62,12 +63,14 @@ class RelayClient(private val context: Context) {
             key,
             preferences.getInt("control_port", 443),
             preferences.getInt("relay_port", 4443),
+            preferences.getInt("bulk_port", 4444),
         )
     }
 
     fun saveServer(info: ServerInfo) {
         preferences.edit().putString("host", info.host).putString("public_key", info.publicKey)
             .putInt("control_port", info.controlPort).putInt("relay_port", info.relayPort)
+            .putInt("bulk_port", info.bulkPort)
             .apply()
     }
 
@@ -204,64 +207,74 @@ class RelayClient(private val context: Context) {
         Log.i("WispFileTransfer", "sending begin transfer=${action.transferId} files=${action.files.size}")
         val token = preferences.getString("session_token", null) ?: error("Connect before sending an action")
         Socket(info.host, info.relayPort).use { socket ->
-            socket.soTimeout = 30_000
+            socket.soTimeout = 10 * 60_000
             val input = socket.reader()
             val output = socket.writer()
             send(output, JSONObject().put("type", "session").put("session_token", token).toString())
             val ready = input.readJson("relay response")
             if (!ready.optBoolean("ok")) error(ready.optString("error", "Relay session failed"))
             val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
+            val prepared = BulkFileCrypto.prepare(
+                sender = "android-user",
+                recipient = wisp.owner,
+                transferId = action.transferId,
+                files = action.files,
+                recipientPublicKey = peerKey,
+            )
 
-            fun exchange(body: JSONObject, advertisePublicKey: Boolean = false): JSONObject {
-                send(output, envelope(wisp.owner, body, peerKey, advertisePublicKey))
-                val accepted = input.readJson("relay response")
-                if (!accepted.optBoolean("ok")) error(accepted.optString("error", "File action rejected"))
-                return decryptResponse(input.readJson("encrypted Wisp response"), wisp.owner, peerKey)
-            }
-
-            val begun = exchange(FileActionProtocol.begin(wisp.id, action), advertisePublicKey = true)
+            send(output, envelope(wisp.owner, FileActionProtocol.begin(wisp.id, action, prepared), peerKey, true))
+            val accepted = input.readJson("relay response")
+            if (!accepted.optBoolean("ok")) error(accepted.optString("error", "File action rejected"))
+            val begun = decryptResponse(input.readJson("encrypted Wisp response"), wisp.owner, peerKey)
             val transferReady = begun.optJSONObject("transfer") ?: error("Wisp did not accept the file action")
             if (transferReady.optString("type") == "error") error(transferReady.optString("error", "File action rejected"))
             if (transferReady.optString("type") != "ready" || transferReady.optString("transfer_id") != action.transferId) {
                 error("Unexpected file-transfer response")
             }
-            val chunkSize = transferReady.optInt("chunk_size", FileTransferStager.MAX_CHUNK_BYTES)
-            require(chunkSize in 1..FileTransferStager.MAX_CHUNK_BYTES) { "Wisp requested an invalid file chunk size" }
-            Log.i("WispFileTransfer", "Wisp ready transfer=${action.transferId} chunkSize=$chunkSize")
+            Log.i("WispFileTransfer", "Wisp ready transfer=${action.transferId} bulkFiles=${prepared.size}")
 
-            action.files.forEach { file ->
-                Log.i("WispFileTransfer", "sending staged file id=${file.id} bytes=${file.size}")
-                file.path.inputStream().use { source ->
-                    val buffer = ByteArray(chunkSize)
-                    var offset = 0L
-                    while (true) {
-                        val count = source.read(buffer)
-                        if (count < 0) break
-                        val chunk = if (count == buffer.size) buffer else buffer.copyOf(count)
-                        val acknowledged = exchange(FileActionProtocol.chunk(wisp.id, action.transferId, file.id, offset, chunk))
-                        val transfer = acknowledged.optJSONObject("transfer") ?: error("Wisp did not acknowledge a file chunk")
-                        if (transfer.optString("type") == "error") error(transfer.optString("error", "File chunk rejected"))
-                        val nextOffset = transfer.optLong("next_offset", -1)
-                        require(
-                            transfer.optString("type") == "chunk_accepted" &&
-                                transfer.optString("file_id") == file.id &&
-                                nextOffset == offset + count
-                        ) { "Unexpected file-chunk acknowledgement" }
-                        offset = nextOffset
-                    }
-                    require(offset == file.size) { "Staged file length changed before upload" }
-                    Log.i("WispFileTransfer", "staged file accepted id=${file.id} bytes=$offset")
-                }
+            prepared.forEach { upload ->
+                sendBulkFile(info, wisp.owner, token, upload)
+                Log.i("WispFileTransfer", "bulk file sent id=${upload.file.id} bytes=${upload.file.size}")
             }
 
-            Log.i("WispFileTransfer", "sending commit transfer=${action.transferId}")
-            val completed = exchange(FileActionProtocol.commit(wisp.id, action.transferId))
+            val completed = decryptResponse(input.readJson("encrypted Wisp completion"), wisp.owner, peerKey)
             completed.optJSONObject("transfer")?.let { transfer ->
                 if (transfer.optString("type") == "error") error(transfer.optString("error", "File action failed"))
             }
-            Log.i("WispFileTransfer", "commit accepted transfer=${action.transferId}")
+            Log.i("WispFileTransfer", "bulk action accepted transfer=${action.transferId}")
             WispState(wisp.id, completed.optJSONObject("response")?.optString("html", "") ?: "")
         }
+        }
+    }
+
+    private fun sendBulkFile(info: ServerInfo, recipient: String, token: String, upload: PreparedBulkUpload) {
+        Socket(info.host, info.bulkPort).use { socket ->
+            socket.soTimeout = 10 * 60_000
+            val input = socket.reader()
+            val output = socket.writer()
+            send(
+                output,
+                JSONObject()
+                    .put("type", "bulk")
+                    .put("session_token", token)
+                    .put("ticket", upload.ticket)
+                    .put("role", "sender")
+                    .put("peer", recipient)
+                    .put("length", upload.ciphertextSize)
+                    .toString(),
+            )
+            val ready = input.readJson("bulk relay readiness")
+            if (!ready.optBoolean("ok") || ready.optString("type") != "bulk_ready") {
+                error(ready.optString("error", "Bulk relay rejected transfer"))
+            }
+            val written = upload.encryptTo(socket.getOutputStream())
+            socket.getOutputStream().flush()
+            require(written == upload.ciphertextSize) { "Bulk ciphertext length mismatch" }
+            val complete = input.readJson("bulk relay completion")
+            if (!complete.optBoolean("ok") || complete.optString("type") != "bulk_complete") {
+                error(complete.optString("error", "Bulk relay did not complete transfer"))
+            }
         }
     }
 

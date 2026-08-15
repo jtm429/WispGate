@@ -6,12 +6,13 @@ The relay is a connection broker and opaque message forwarder. It does not rende
 
 The relay is deployed to a Microsoft Azure VM that may be stopped between sessions to control cost. Availability is expected to be intermittent. The relay process is a boot service: it must be enabled in the VM's startup configuration and start automatically as soon as the operating system is ready, without requiring an interactive login.
 
-It accepts client connections on two ports:
+It accepts client connections on three ports:
 
 - **Control port**: bootstrap, authentication, catalog, applet package delivery, health, and session management.
 - **Relay port**: persistent application traffic and opaque end-to-end-encrypted envelopes.
+- **Bulk port**: authenticated pairing and exact-length forwarding of opaque file ciphertext.
 
-The exact port numbers are deployment configuration; the initial conventional values may be `443` for control and `4443` for relay.
+The exact port numbers are deployment configuration; the initial conventional values are `443` for control, `4443` for relay, and `4444` for bulk ciphertext.
 
 ## Network behavior
 
@@ -21,6 +22,7 @@ Clients initiate outbound connections:
 user client  ──outbound──> control port
 webapp host  ──outbound──> control port
               relay port
+              bulk port (during file transfer)
 ```
 
 The server may push messages over either established connection. Clients do not need router port forwarding.
@@ -33,7 +35,7 @@ The Azure VM deployment must provide:
 
 - automatic relay startup on operating-system boot;
 - automatic restart if the relay process exits unexpectedly;
-- readiness only after both ports are bound and the server key/configuration are loaded;
+- readiness only after all three ports are bound and the server key/configuration are loaded;
 - a lightweight health/readiness check for operational verification;
 - persistent server identity and configuration outside the process working directory;
 - persisted records of previously connected clients and their reconnect endpoints/session metadata;
@@ -48,7 +50,7 @@ Azure VM starts
   -> operating system boots
   -> relay service starts automatically
   -> relay loads persistent keys/configuration
-  -> control and relay ports become ready
+  -> control, relay, and bulk ports become ready
   -> clients reconnect
 ```
 

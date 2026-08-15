@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .e2e import (
     decrypt_envelope,
@@ -34,6 +35,7 @@ class ServerInfo:
     relay_port: int
     server_public_key: bytes
     deployment_id: str = "private"
+    bulk_port: int = 4444
 
 
 @dataclass
@@ -84,6 +86,7 @@ class _IncomingFile:
     size: int
     path: Path
     received: int = 0
+    bulk: dict[str, Any] | None = None
 
 
 @dataclass
@@ -94,10 +97,10 @@ class _IncomingTransfer:
     directory: Path
     files: dict[str, _IncomingFile]
     created_at: float
+    task: asyncio.Task[None] | None = None
 
 
 class AppserveClient:
-    FILE_CHUNK_BYTES = 24 * 1024
     MAX_FILES_PER_ACTION = 32
     MAX_FILE_ACTION_BYTES = 256 * 1024 * 1024
     MAX_ACTIVE_TRANSFERS_PER_SENDER = 4
@@ -123,6 +126,7 @@ class AppserveClient:
         self._transfer_directory = Path(transfer_directory) if transfer_directory else Path(tempfile.gettempdir()) / "wispgate-transfers"
         self._transfers: dict[tuple[str, str], _IncomingTransfer] = {}
         self._peer_keys: dict[str, str] = {}
+        self._send_lock = asyncio.Lock()
         if self._peer_store_path and self._peer_store_path.exists():
             stored = json.loads(self._peer_store_path.read_text(encoding="utf-8"))
             if isinstance(stored, dict):
@@ -183,6 +187,11 @@ class AppserveClient:
                 await writer.wait_closed()
             except (ConnectionError, OSError):
                 pass
+        tasks = [transfer.task for transfer in self._transfers.values() if transfer.task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         for transfer in list(self._transfers.values()):
             self._cleanup_transfer(transfer)
         self._transfers.clear()
@@ -193,7 +202,10 @@ class AppserveClient:
         self._reader = self._writer = None
         self._session_token = None
         for transfer in list(self._transfers.values()):
-            self._cleanup_transfer(transfer)
+            if transfer.task is not None:
+                transfer.task.cancel()
+            else:
+                self._cleanup_transfer(transfer)
         self._transfers.clear()
 
     async def _event_loop(self) -> None:
@@ -239,15 +251,10 @@ class AppserveClient:
         if action_kind == "state_request":
             state = wisp.state()
             response = {"wisp_id": wisp.id, "response": state}
-        elif action_kind in {"file_begin", "file_chunk", "file_commit"}:
+        elif action_kind == "file_begin":
             transfer_id = str(body.get("transfer_id", ""))
             try:
-                if action_kind == "file_begin":
-                    response = self._begin_file_action(sender, wisp, body)
-                elif action_kind == "file_chunk":
-                    response = self._accept_file_chunk(sender, wisp, body)
-                else:
-                    response = await self._commit_file_action(sender, wisp, body)
+                response = self._begin_file_action(sender, wisp, body)
             except (KeyError, TypeError, ValueError) as cause:
                 transfer = self._transfers.pop((sender, transfer_id), None)
                 if transfer is not None:
@@ -257,6 +264,11 @@ class AppserveClient:
                     "transfer_id": transfer_id,
                     "error": str(cause),
                 })
+            await self._send_envelope(sender, response)
+            transfer = self._transfers.get((sender, transfer_id))
+            if transfer is not None:
+                transfer.task = asyncio.create_task(self._receive_bulk_transfer(transfer_id, transfer))
+            return
         else:
             result = wisp.action(WispAction(body.get("action_data", {})))
             state = await result if asyncio.iscoroutine(result) else result
@@ -310,7 +322,24 @@ class AppserveClient:
                     raise ValueError("file action exceeds the configured size limit")
                 path = directory / f"{index}.upload"
                 path.touch()
-                files[file_id] = _IncomingFile(file_id, field, name, content_type, size, path)
+                bulk = manifest.get("bulk")
+                if not isinstance(bulk, dict):
+                    raise ValueError("file manifest requires bulk transport metadata")
+                ticket = bulk.get("ticket")
+                encrypted_key = bulk.get("encrypted_key")
+                nonce = bulk.get("nonce")
+                ciphertext_size = bulk.get("ciphertext_size")
+                if (
+                    bulk.get("algorithm") != "RSA-OAEP-256+A256GCM"
+                    or not isinstance(ticket, str) or not 16 <= len(ticket) <= 256
+                    or not isinstance(encrypted_key, str) or not encrypted_key
+                    or not isinstance(nonce, str) or not nonce
+                    or ciphertext_size != size + 16
+                ):
+                    raise ValueError("invalid bulk transport metadata")
+                files[file_id] = _IncomingFile(
+                    file_id, field, name, content_type, size, path, bulk=dict(bulk)
+                )
         except Exception:
             shutil.rmtree(directory, ignore_errors=True)
             raise
@@ -319,71 +348,97 @@ class AppserveClient:
         return self._transfer_response(wisp, {
             "type": "ready",
             "transfer_id": transfer_id,
-            "chunk_size": self.FILE_CHUNK_BYTES,
         })
 
-    def _accept_file_chunk(self, sender: str, wisp: Wisp, body: dict[str, Any]) -> dict[str, Any]:
-        transfer_id = str(body.get("transfer_id", ""))
-        transfer = self._transfers.get((sender, transfer_id))
-        if transfer is None or transfer.wisp.id != wisp.id:
-            raise ValueError("unknown file transfer")
-        file_id = str(body.get("file_id", ""))
-        incoming = transfer.files.get(file_id)
-        if incoming is None:
-            raise ValueError("unknown file in transfer")
-        offset = body.get("offset")
-        if offset != incoming.received:
-            raise ValueError(f"unexpected file offset; expected {incoming.received}")
-        encoded = body.get("data")
-        if not isinstance(encoded, str):
-            raise ValueError("file chunk data must be base64url text")
+    async def _receive_bulk_transfer(self, transfer_id: str, transfer: _IncomingTransfer) -> None:
+        key = (transfer.sender, transfer_id)
         try:
-            chunk = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
-        except Exception as cause:
-            raise ValueError("invalid file chunk encoding") from cause
-        if len(chunk) > self.FILE_CHUNK_BYTES or incoming.received + len(chunk) > incoming.size:
-            raise ValueError("file chunk exceeds the declared size")
-        if not chunk and incoming.received < incoming.size:
-            raise ValueError("empty file chunk cannot advance the transfer")
-        with incoming.path.open("ab") as target:
-            target.write(chunk)
-        incoming.received += len(chunk)
-        return self._transfer_response(wisp, {
-            "type": "chunk_accepted",
-            "transfer_id": transfer_id,
-            "file_id": file_id,
-            "next_offset": incoming.received,
-        })
-
-    async def _commit_file_action(self, sender: str, wisp: Wisp, body: dict[str, Any]) -> dict[str, Any]:
-        transfer_id = str(body.get("transfer_id", ""))
-        key = (sender, transfer_id)
-        transfer = self._transfers.get(key)
-        if transfer is None or transfer.wisp.id != wisp.id:
-            raise ValueError("unknown file transfer")
-        self._transfers.pop(key)
-        try:
-            incomplete = [file.name for file in transfer.files.values() if file.received != file.size]
-            if incomplete:
-                return self._transfer_response(wisp, {
+            try:
+                for incoming in transfer.files.values():
+                    await self._receive_bulk_file(transfer.sender, transfer_id, incoming)
+                grouped: dict[str, list[UploadedFile]] = {}
+                for file in transfer.files.values():
+                    grouped.setdefault(file.field, []).append(
+                        UploadedFile(file.field, file.name, file.content_type, file.size, file.path)
+                    )
+                exposed: dict[str, UploadedFile | tuple[UploadedFile, ...]] = {
+                    field: items[0] if len(items) == 1 else tuple(items)
+                    for field, items in grouped.items()
+                }
+                result = transfer.wisp.action(WispAction(transfer.action_data, exposed))
+                state = await result if asyncio.iscoroutine(result) else result
+                response = {"wisp_id": transfer.wisp.id, "response": state}
+            except asyncio.CancelledError:
+                raise
+            except Exception as cause:
+                response = self._transfer_response(transfer.wisp, {
                     "type": "error",
                     "transfer_id": transfer_id,
-                    "error": "incomplete file transfer",
+                    "error": str(cause),
                 })
-            grouped: dict[str, list[UploadedFile]] = {}
-            for file in transfer.files.values():
-                grouped.setdefault(file.field, []).append(
-                    UploadedFile(file.field, file.name, file.content_type, file.size, file.path)
-                )
-            exposed: dict[str, UploadedFile | tuple[UploadedFile, ...]] = {
-                field: items[0] if len(items) == 1 else tuple(items)
-                for field, items in grouped.items()
-            }
-            result = wisp.action(WispAction(transfer.action_data, exposed))
-            state = await result if asyncio.iscoroutine(result) else result
-            return {"wisp_id": wisp.id, "response": state}
+            await self._send_envelope(transfer.sender, response)
         finally:
+            self._transfers.pop(key, None)
             self._cleanup_transfer(transfer)
+
+    async def _receive_bulk_file(self, sender: str, transfer_id: str, incoming: _IncomingFile) -> None:
+        assert incoming.bulk is not None
+        assert self._session_token is not None
+        bulk = incoming.bulk
+        encrypted_key = base64.urlsafe_b64decode(bulk["encrypted_key"] + "=" * (-len(bulk["encrypted_key"]) % 4))
+        nonce = base64.urlsafe_b64decode(bulk["nonce"] + "=" * (-len(bulk["nonce"]) % 4))
+        if len(nonce) != 12:
+            raise ValueError("invalid bulk nonce")
+        file_key = self._identity_key.decrypt(
+            encrypted_key,
+            padding.OAEP(mgf=padding.MGF1(hashes.SHA1()), algorithm=hashes.SHA256(), label=None),
+        )
+        if len(file_key) != 32:
+            raise ValueError("invalid bulk content key")
+        reader, writer = await asyncio.open_connection(self.info.host, self.info.bulk_port)
+        try:
+            await self._send(writer, {
+                "type": "bulk",
+                "session_token": self._session_token,
+                "ticket": bulk["ticket"],
+                "role": "receiver",
+                "peer": sender,
+                "length": bulk["ciphertext_size"],
+            })
+            ready = await self._read(reader)
+            if not ready.get("ok") or ready.get("type") != "bulk_ready":
+                raise ConnectionError(ready.get("error", "bulk relay rejected transfer"))
+            aad = b"\0".join([
+                b"wispgate-bulk-v1",
+                sender.encode(),
+                self.client_id.encode(),
+                transfer_id.encode(),
+                incoming.id.encode(),
+                bulk["ticket"].encode(),
+                str(incoming.size).encode(),
+            ])
+            decryptor = Cipher(algorithms.AES(file_key), modes.GCM(nonce)).decryptor()
+            decryptor.authenticate_additional_data(aad)
+            remaining = bulk["ciphertext_size"] - 16
+            written = 0
+            with incoming.path.open("wb") as target:
+                while remaining:
+                    chunk = await reader.readexactly(min(256 * 1024, remaining))
+                    plaintext = decryptor.update(chunk)
+                    target.write(plaintext)
+                    written += len(plaintext)
+                    remaining -= len(chunk)
+                tag = await reader.readexactly(16)
+                final = decryptor.finalize_with_tag(tag)
+                target.write(final)
+                written += len(final)
+            if written != incoming.size:
+                raise ValueError("bulk file length did not match its manifest")
+            incoming.received = written
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
 
     @staticmethod
     def _cleanup_transfer(transfer: _IncomingTransfer) -> None:
@@ -400,17 +455,18 @@ class AppserveClient:
         recipient_key = self._peer_keys.get(recipient)
         if not recipient_key:
             raise ValueError(f"no trusted public key for {recipient}")
-        await self._send(
-            self._writer,
-            encrypt_envelope(
-                sender=self.client_id,
-                recipient=recipient,
-                message_id=secrets.token_urlsafe(16),
-                body=body,
-                recipient_public_key=recipient_key,
-                sender_private_key=self._identity_key,
-            ),
-        )
+        async with self._send_lock:
+            await self._send(
+                self._writer,
+                encrypt_envelope(
+                    sender=self.client_id,
+                    recipient=recipient,
+                    message_id=secrets.token_urlsafe(16),
+                    body=body,
+                    recipient_public_key=recipient_key,
+                    sender_private_key=self._identity_key,
+                ),
+            )
 
     def _bootstrap_payload(self) -> str:
         key = serialization.load_der_public_key(self.info.server_public_key)
@@ -451,6 +507,7 @@ def load(path: str | Path) -> AppserveClient:
             relay_port=int(data.get("relay_port", 4443)),
             server_public_key=base64.urlsafe_b64decode(key),
             deployment_id=data.get("deployment_id", "private"),
+            bulk_port=int(data.get("bulk_port", 4444)),
         ),
         client_id=client_id,
         identity_key=load_or_create_identity(identity_path),

@@ -127,7 +127,24 @@ class WispFileTransferTest {
     }
 
     @Test
-    fun buildsGenericProtocolBodiesWithoutAppSpecificFields() {
+    fun foregroundTransferRegistryHandsEachJobToTheServiceOnlyOnce() {
+        val directory = Files.createTempDirectory("wisp-service-test").toFile()
+        val action = StagedFileAction("transfer-service", JSONObject(), directory, emptyList())
+        val job = BulkTransferJob(
+            RelayClient.ServerInfo("relay", "key"),
+            RelayClient.Wisp("wisp", "Wisp", "", "owner", "peer-key"),
+            action,
+        )
+
+        BulkTransferJobs.put(job)
+
+        assertTrue(BulkTransferJobs.take(action.transferId) === job)
+        assertEquals(null, BulkTransferJobs.take(action.transferId))
+        directory.deleteRecursively()
+    }
+
+    @Test
+    fun preparesOneHybridEncryptedRawStreamWithoutChunkMessages() {
         val directory = Files.createTempDirectory("wisp-protocol-test").toFile()
         val file = directory.resolve("0.upload").apply { writeText("hello") }
         val action = StagedFileAction(
@@ -136,16 +153,40 @@ class WispFileTransferTest {
             directory,
             listOf(StagedUpload("f", "attachment", "hello.txt", "text/plain", 5, file)),
         )
+        val keyPair = java.security.KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val recipientKey = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(keyPair.public.encoded)
 
-        val begin = FileActionProtocol.begin("wisp-1", action)
-        val chunk = FileActionProtocol.chunk("wisp-1", "transfer-1", "f", 0, byteArrayOf(1, 2, 3))
-        val commit = FileActionProtocol.commit("wisp-1", "transfer-1")
+        val prepared = BulkFileCrypto.prepare(
+            sender = "android-user",
+            recipient = "wisp-owner",
+            transferId = action.transferId,
+            files = action.files,
+            recipientPublicKey = recipientKey,
+        )
+        val begin = FileActionProtocol.begin("wisp-1", action, prepared)
+        val offer = begin.getJSONArray("files").getJSONObject(0).getJSONObject("bulk")
+        val encrypted = java.io.ByteArrayOutputStream()
+        prepared.single().encryptTo(encrypted)
+
+        val unwrap = javax.crypto.Cipher.getInstance("RSA/ECB/OAEPPadding").apply {
+            init(javax.crypto.Cipher.DECRYPT_MODE, keyPair.private, E2EEnvelope.oaepParameters())
+        }
+        val fileKey = unwrap.doFinal(java.util.Base64.getUrlDecoder().decode(offer.getString("encrypted_key")))
+        val decrypt = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding").apply {
+            init(
+                javax.crypto.Cipher.DECRYPT_MODE,
+                javax.crypto.spec.SecretKeySpec(fileKey, "AES"),
+                javax.crypto.spec.GCMParameterSpec(128, java.util.Base64.getUrlDecoder().decode(offer.getString("nonce"))),
+            )
+            updateAAD(prepared.single().aad())
+        }
 
         assertEquals("file_begin", begin.getString("action"))
-        assertEquals(5, begin.getJSONArray("files").getJSONObject(0).getLong("size"))
-        assertEquals("file_chunk", chunk.getString("action"))
-        assertEquals("AQID", chunk.getString("data"))
-        assertEquals("file_commit", commit.getString("action"))
+        assertEquals("RSA-OAEP-256+A256GCM", offer.getString("algorithm"))
+        assertTrue(offer.getString("ticket").length >= 16)
+        assertEquals(21, encrypted.size())
+        assertEquals("hello", String(decrypt.doFinal(encrypted.toByteArray())))
+        assertFalse(begin.toString().contains("file_chunk"))
         action.cleanup()
     }
 }

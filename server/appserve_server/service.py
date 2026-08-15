@@ -6,6 +6,7 @@ import json
 import logging
 import secrets
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,13 @@ class RelayRuntime:
     sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
     control_sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
     update_command: tuple[str, ...] | None = None
+    pending_bulk: dict[str, "_BulkConnection"] = field(default_factory=dict)
+    consumed_bulk: dict[str, float] = field(default_factory=dict)
+    bulk_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    MAX_BULK_BYTES = 256 * 1024 * 1024 + 16
+    MAX_PENDING_BULK = 128
+    BULK_TICKET_TTL_SECONDS = 10 * 60
 
     def catalog_items(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -166,6 +174,96 @@ class RelayRuntime:
             writer.close()
             await writer.wait_closed()
 
+    async def handle_bulk(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        connection: _BulkConnection | None = None
+        try:
+            header = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
+            token = header.get("session_token")
+            client_id = next(
+                (cid for cid, record in self.state.clients.items() if record.get("session_token") == token),
+                None,
+            )
+            if not client_id:
+                await send_json(writer, {"ok": False, "error": "unauthenticated"})
+                return
+            ticket = header.get("ticket")
+            role = header.get("role")
+            peer = header.get("peer")
+            length = header.get("length")
+            if (
+                header.get("type") != "bulk"
+                or not isinstance(ticket, str) or not 16 <= len(ticket) <= 256
+                or role not in {"sender", "receiver"}
+                or not isinstance(peer, str) or not peer or peer == client_id
+                or not isinstance(length, int) or isinstance(length, bool)
+                or not 16 <= length <= self.MAX_BULK_BYTES
+            ):
+                await send_json(writer, {"ok": False, "error": "invalid_bulk_offer"})
+                return
+            connection = _BulkConnection(client_id, peer, role, length, reader, writer)
+            async with self.bulk_lock:
+                now = time.monotonic()
+                self.consumed_bulk = {
+                    used_ticket: expires
+                    for used_ticket, expires in self.consumed_bulk.items()
+                    if expires > now
+                }
+                if ticket in self.consumed_bulk:
+                    await send_json(writer, {"ok": False, "error": "bulk_ticket_used"})
+                    return
+                waiting = self.pending_bulk.pop(ticket, None)
+                if waiting is None:
+                    if len(self.pending_bulk) >= self.MAX_PENDING_BULK:
+                        await send_json(writer, {"ok": False, "error": "too_many_pending_bulk_offers"})
+                        return
+                    self.pending_bulk[ticket] = connection
+                elif (
+                    waiting.role == role
+                    or waiting.client_id != peer
+                    or waiting.peer != client_id
+                    or waiting.length != length
+                ):
+                    self.pending_bulk[ticket] = waiting
+                    await send_json(writer, {"ok": False, "error": "bulk_pair_mismatch"})
+                    return
+                else:
+                    self.consumed_bulk[ticket] = now + self.BULK_TICKET_TTL_SECONDS
+                    sender = connection if connection.role == "sender" else waiting
+                    receiver = connection if connection.role == "receiver" else waiting
+                    task = asyncio.create_task(self._pipe_bulk(sender, receiver))
+                    connection.task = task
+                    waiting.task = task
+            if connection.task is None:
+                await asyncio.wait_for(connection.paired.wait(), timeout=30)
+            assert connection.task is not None
+            await connection.task
+        except (asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError, json.JSONDecodeError, OSError):
+            pass
+        finally:
+            if connection is not None:
+                async with self.bulk_lock:
+                    for ticket, waiting in list(self.pending_bulk.items()):
+                        if waiting is connection:
+                            self.pending_bulk.pop(ticket, None)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
+
+    async def _pipe_bulk(self, sender: "_BulkConnection", receiver: "_BulkConnection") -> None:
+        sender.paired.set()
+        receiver.paired.set()
+        await send_json(sender.writer, {"ok": True, "type": "bulk_ready"})
+        await send_json(receiver.writer, {"ok": True, "type": "bulk_ready"})
+        remaining = sender.length
+        while remaining:
+            chunk = await sender.reader.readexactly(min(256 * 1024, remaining))
+            receiver.writer.write(chunk)
+            await receiver.writer.drain()
+            remaining -= len(chunk)
+        await send_json(sender.writer, {"ok": True, "type": "bulk_complete"})
+
     async def forward(self, sender: str, envelope: dict[str, Any]) -> None:
         recipient = envelope.get("recipient")
         required = {"version", "type", "sender", "recipient", "message_id", "algorithm", "encrypted_key", "nonce", "ciphertext", "signature"}
@@ -200,10 +298,32 @@ async def send_json(writer: asyncio.StreamWriter, value: dict[str, Any]) -> None
     await writer.drain()
 
 
-async def serve(runtime: RelayRuntime, control_host: str, control_port: int, relay_host: str, relay_port: int) -> None:
+@dataclass
+class _BulkConnection:
+    client_id: str
+    peer: str
+    role: str
+    length: int
+    reader: asyncio.StreamReader
+    writer: asyncio.StreamWriter
+    paired: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task[None] | None = None
+
+
+async def serve(
+    runtime: RelayRuntime,
+    control_host: str,
+    control_port: int,
+    relay_host: str,
+    relay_port: int,
+    bulk_host: str = "0.0.0.0",
+    bulk_port: int = 4444,
+) -> None:
     control = await asyncio.start_server(runtime.handle_control, control_host, control_port)
     relay = await asyncio.start_server(runtime.handle_relay, relay_host, relay_port)
+    bulk = await asyncio.start_server(runtime.handle_bulk, bulk_host, bulk_port)
     LOG.info("control listening on %s:%s", control_host, control_port)
     LOG.info("relay listening on %s:%s", relay_host, relay_port)
-    async with control, relay:
-        await asyncio.gather(control.serve_forever(), relay.serve_forever())
+    LOG.info("bulk listening on %s:%s", bulk_host, bulk_port)
+    async with control, relay, bulk:
+        await asyncio.gather(control.serve_forever(), relay.serve_forever(), bulk.serve_forever())

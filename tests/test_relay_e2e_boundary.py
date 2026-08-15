@@ -114,3 +114,92 @@ def test_offline_routing_does_not_require_decrypting_application_action(tmp_path
 
     assert sender.messages == [{"ok": False, "error": "recipient_offline"}]
     assert relay.state.queues == {}
+
+
+def test_bulk_relay_pairs_authenticated_peers_and_copies_exact_ciphertext(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        relay = runtime(tmp_path)
+        relay.state.clients["android-user"] = {"session_token": "android-token"}
+        relay.state.clients["upload-wisp"] = {"session_token": "wisp-token"}
+        server = await asyncio.start_server(relay.handle_bulk, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            receiver_reader, receiver_writer = await asyncio.open_connection("127.0.0.1", port)
+            receiver_writer.write(json.dumps({
+                "type": "bulk",
+                "session_token": "wisp-token",
+                "ticket": "one-time-ticket-1",
+                "role": "receiver",
+                "peer": "android-user",
+                "length": 16,
+            }).encode() + b"\n")
+            await receiver_writer.drain()
+
+            sender_reader, sender_writer = await asyncio.open_connection("127.0.0.1", port)
+            sender_writer.write(json.dumps({
+                "type": "bulk",
+                "session_token": "android-token",
+                "ticket": "one-time-ticket-1",
+                "role": "sender",
+                "peer": "upload-wisp",
+                "length": 16,
+            }).encode() + b"\n")
+            await sender_writer.drain()
+
+            assert json.loads(await sender_reader.readline()) == {"ok": True, "type": "bulk_ready"}
+            assert json.loads(await receiver_reader.readline()) == {"ok": True, "type": "bulk_ready"}
+            sender_writer.write(b"hello world12345EXTRA")
+            await sender_writer.drain()
+
+            assert await receiver_reader.readexactly(16) == b"hello world12345"
+            assert json.loads(await sender_reader.readline()) == {"ok": True, "type": "bulk_complete"}
+
+            sender_writer.close()
+            receiver_writer.close()
+            await sender_writer.wait_closed()
+            await receiver_writer.wait_closed()
+
+            reused_reader, reused_writer = await asyncio.open_connection("127.0.0.1", port)
+            reused_writer.write(json.dumps({
+                "type": "bulk",
+                "session_token": "android-token",
+                "ticket": "one-time-ticket-1",
+                "role": "sender",
+                "peer": "upload-wisp",
+                "length": 16,
+            }).encode() + b"\n")
+            await reused_writer.drain()
+            assert json.loads(await reused_reader.readline()) == {"ok": False, "error": "bulk_ticket_used"}
+            reused_writer.close()
+            await reused_writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_bulk_relay_rejects_unknown_session_token(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        relay = runtime(tmp_path)
+        server = await asyncio.start_server(relay.handle_bulk, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(json.dumps({
+                "type": "bulk",
+                "session_token": "not-registered",
+                "ticket": "ticket",
+                "role": "sender",
+                "peer": "upload-wisp",
+                "length": 1,
+            }).encode() + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline()) == {"ok": False, "error": "unauthenticated"}
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())

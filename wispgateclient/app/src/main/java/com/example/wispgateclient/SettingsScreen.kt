@@ -33,9 +33,10 @@ fun SettingsScreen(
     var key by remember(initial) { mutableStateOf(initial.publicKey) }
     var controlPort by remember(initial) { mutableStateOf(initial.controlPort.toString()) }
     var relayPort by remember(initial) { mutableStateOf(initial.relayPort.toString()) }
+    var bulkPort by remember(initial) { mutableStateOf(initial.bulkPort.toString()) }
 
     val valid = host.isNotBlank() && key.isNotBlank() &&
-        controlPort.toIntOrNull() != null && relayPort.toIntOrNull() != null
+        controlPort.toIntOrNull() != null && relayPort.toIntOrNull() != null && bulkPort.toIntOrNull() != null
 
     Column(
         Modifier.fillMaxSize().padding(24.dp),
@@ -52,6 +53,8 @@ fun SettingsScreen(
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(relayPort, { relayPort = it }, label = { Text("Relay port") }, singleLine = true)
         Spacer(Modifier.height(12.dp))
+        OutlinedTextField(bulkPort, { bulkPort = it }, label = { Text("Bulk port") }, singleLine = true)
+        Spacer(Modifier.height(12.dp))
         Button(enabled = !updating, onClick = onUpdate) {
             Text(if (updating) "Updating…" else "Update server from GitHub")
         }
@@ -62,7 +65,11 @@ fun SettingsScreen(
             Button(
                 enabled = valid,
                 onClick = {
-                    onSave(RelayClient.ServerInfo(host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt()))
+                    onSave(
+                        RelayClient.ServerInfo(
+                            host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt(), bulkPort.toInt(),
+                        ),
+                    )
                 },
             ) { Text("Save and reconnect") }
         }

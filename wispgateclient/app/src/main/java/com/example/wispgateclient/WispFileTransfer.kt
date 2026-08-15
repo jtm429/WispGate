@@ -150,16 +150,27 @@ class FileTransferStager(
 }
 
 object FileActionProtocol {
-    fun begin(wispId: String, action: StagedFileAction): JSONObject {
+    fun begin(wispId: String, action: StagedFileAction, prepared: List<PreparedBulkUpload>): JSONObject {
+        require(prepared.map { it.file.id } == action.files.map { it.id }) { "Prepared files do not match staged files" }
         val files = JSONArray()
-        action.files.forEach { file ->
+        prepared.forEach { upload ->
+            val file = upload.file
             files.put(
                 JSONObject()
                     .put("id", file.id)
                     .put("field", file.field)
                     .put("name", file.name)
                     .put("content_type", file.contentType)
-                    .put("size", file.size),
+                    .put("size", file.size)
+                    .put(
+                        "bulk",
+                        JSONObject()
+                            .put("algorithm", "RSA-OAEP-256+A256GCM")
+                            .put("ticket", upload.ticket)
+                            .put("encrypted_key", upload.encryptedKey)
+                            .put("nonce", upload.nonce)
+                            .put("ciphertext_size", upload.ciphertextSize),
+                    ),
             )
         }
         return JSONObject()
@@ -169,21 +180,6 @@ object FileActionProtocol {
             .put("action_data", action.actionData)
             .put("files", files)
     }
-
-    fun chunk(wispId: String, transferId: String, fileId: String, offset: Long, data: ByteArray): JSONObject =
-        JSONObject()
-            .put("wisp_id", wispId)
-            .put("action", "file_chunk")
-            .put("transfer_id", transferId)
-            .put("file_id", fileId)
-            .put("offset", offset)
-            .put("data", Base64Url.encode(data))
-
-    fun commit(wispId: String, transferId: String): JSONObject =
-        JSONObject()
-            .put("wisp_id", wispId)
-            .put("action", "file_commit")
-            .put("transfer_id", transferId)
 }
 
 object WispHtmlRuntime {

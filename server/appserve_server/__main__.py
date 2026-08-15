@@ -20,6 +20,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--control-port", type=int, default=443)
     result.add_argument("--relay-host", default="0.0.0.0")
     result.add_argument("--relay-port", type=int, default=4443)
+    result.add_argument("--bulk-host", default="0.0.0.0")
+    result.add_argument("--bulk-port", type=int, default=4444)
     result.add_argument("--log-level", default="INFO")
     result.add_argument("--update-script", type=Path)
     return result
@@ -37,7 +39,15 @@ def main() -> None:
         state,
         update_command=update_command,
     )
-    asyncio.run(serve(runtime, args.control_host, args.control_port, args.relay_host, args.relay_port))
+    asyncio.run(serve(
+        runtime,
+        args.control_host,
+        args.control_port,
+        args.relay_host,
+        args.relay_port,
+        args.bulk_host,
+        args.bulk_port,
+    ))
 
 
 if __name__ == "__main__":

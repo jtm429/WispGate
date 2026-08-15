@@ -20,6 +20,12 @@ class RecordingWriter:
     async def drain(self) -> None:
         pass
 
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        pass
+
 
 def test_public_package_exports_reusable_file_action_types() -> None:
     from appserve import UploadedFile as PublicUploadedFile
@@ -85,11 +91,26 @@ def test_python_wisp_decrypts_first_refresh_and_encrypts_response(tmp_path: Path
     assert body == {"wisp_id": "prime", "response": {"html": "<p>secret state</p>"}}
 
 
-def test_encrypted_file_manifest_chunks_and_commit_invoke_generic_wisp_action(tmp_path: Path) -> None:
+def test_encrypted_bulk_file_invokes_generic_wisp_action(tmp_path: Path) -> None:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
     android = generate_identity()
     wisp_identity = generate_identity()
-    info, _ = make_info(tmp_path)
     observed: dict[str, object] = {}
+    plaintext = b"hello world"
+    ticket = "bulk-ticket-1234567890"
+    file_key = AESGCM.generate_key(bit_length=256)
+    nonce = b"0123456789ab"
+    aad = b"\0".join([
+        b"wispgate-bulk-v1", b"android-user", b"upload-wisp", b"transfer-1", b"file-1", ticket.encode(), b"11",
+    ])
+    ciphertext = AESGCM(file_key).encrypt(nonce, plaintext, aad)
+    wrapped_key = wisp_identity.public_key().encrypt(
+        file_key,
+        padding.OAEP(mgf=padding.MGF1(hashes.SHA1()), algorithm=hashes.SHA256(), label=None),
+    )
 
     def handle(action: WispAction) -> dict[str, str]:
         upload = action.files["recording"]
@@ -102,118 +123,88 @@ def test_encrypted_file_manifest_chunks_and_commit_invoke_generic_wisp_action(tm
         )
         return {"html": "<p>received</p>"}
 
-    client = AppserveClient(info, "upload-wisp", identity_key=wisp_identity, transfer_directory=tmp_path / "uploads")
-    client.register(Wisp("upload", "Upload", "", state=lambda: {"html": ""}, action=handle))
-    writer = RecordingWriter()
-    client._writer = writer  # type: ignore[assignment]
+    async def scenario() -> tuple[dict, dict]:
+        received_header: dict = {}
 
-    async def send(body: dict) -> dict:
+        async def bulk_server(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            received_header.update(json.loads(await reader.readline()))
+            writer.write(b'{"ok":true,"type":"bulk_ready"}\n' + ciphertext)
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        server = await asyncio.start_server(bulk_server, "127.0.0.1", 0)
+        bulk_port = server.sockets[0].getsockname()[1]
+        info, _ = make_info(tmp_path)
+        info = ServerInfo("127.0.0.1", info.control_port, info.relay_port, info.server_public_key, bulk_port=bulk_port)
+        client = AppserveClient(info, "upload-wisp", identity_key=wisp_identity, transfer_directory=tmp_path / "uploads")
+        client._session_token = "wisp-session"
+        client.register(Wisp("upload", "Upload", "", state=lambda: {"html": ""}, action=handle))
+        writer = RecordingWriter()
+        client._writer = writer  # type: ignore[assignment]
         request = encrypt_envelope(
             sender="android-user",
             recipient="upload-wisp",
-            message_id=f"request-{len(writer.messages)}",
-            body=body,
+            message_id="request-1",
+            body={
+                "wisp_id": "upload",
+                "action": "file_begin",
+                "transfer_id": "transfer-1",
+                "action_data": {"type": "transcribe", "language": "en"},
+                "files": [{
+                    "id": "file-1",
+                    "field": "recording",
+                    "name": "voice.ogg",
+                    "content_type": "audio/ogg",
+                    "size": len(plaintext),
+                    "bulk": {
+                        "algorithm": "RSA-OAEP-256+A256GCM",
+                        "ticket": ticket,
+                        "encrypted_key": base64.urlsafe_b64encode(wrapped_key).decode().rstrip("="),
+                        "nonce": base64.urlsafe_b64encode(nonce).decode().rstrip("="),
+                        "ciphertext_size": len(ciphertext),
+                    },
+                }],
+            },
             recipient_public_key=public_key_text(wisp_identity),
             sender_private_key=android,
-            advertise_sender_key=not writer.messages,
+            advertise_sender_key=True,
         )
         await client._handle_envelope(request)
-        response, _ = decrypt_envelope(writer.messages[-1], android, public_key_text(wisp_identity))
-        return response
+        ready, _ = decrypt_envelope(writer.messages[0], android, public_key_text(wisp_identity))
+        assert ready["transfer"] == {"type": "ready", "transfer_id": "transfer-1"}
+        for _ in range(100):
+            if len(writer.messages) == 2:
+                break
+            await asyncio.sleep(0.01)
+        if len(writer.messages) != 2:
+            transfer = client._transfers.get(("android-user", "transfer-1"))
+            task = transfer.task if transfer else None
+            detail = task.exception() if task and task.done() and not task.cancelled() else None
+            raise AssertionError(f"bulk completion missing; header={received_header!r} task={detail!r}")
+        complete, _ = decrypt_envelope(writer.messages[1], android, public_key_text(wisp_identity))
+        await client.close()
+        server.close()
+        await server.wait_closed()
+        return ready, complete, received_header
 
-    async def scenario() -> tuple[dict, dict, dict]:
-        ready = await send({
-            "wisp_id": "upload",
-            "action": "file_begin",
-            "transfer_id": "transfer-1",
-            "action_data": {"type": "transcribe", "language": "en"},
-            "files": [{
-                "id": "file-1",
-                "field": "recording",
-                "name": "voice.ogg",
-                "content_type": "audio/ogg",
-                "size": 11,
-            }],
-        })
-        chunk = await send({
-            "wisp_id": "upload",
-            "action": "file_chunk",
-            "transfer_id": "transfer-1",
-            "file_id": "file-1",
-            "offset": 0,
-            "data": base64.urlsafe_b64encode(b"hello world").decode().rstrip("="),
-        })
-        complete = await send({
-            "wisp_id": "upload",
-            "action": "file_commit",
-            "transfer_id": "transfer-1",
-        })
-        return ready, chunk, complete
+    ready, complete, received_header = asyncio.run(scenario())
 
-    ready, chunk, complete = asyncio.run(scenario())
-
-    assert ready["transfer"] == {
-        "type": "ready",
-        "transfer_id": "transfer-1",
-        "chunk_size": AppserveClient.FILE_CHUNK_BYTES,
-    }
-    assert chunk["transfer"] == {
-        "type": "chunk_accepted",
-        "transfer_id": "transfer-1",
-        "file_id": "file-1",
-        "next_offset": 11,
-    }
+    assert ready["transfer"] == {"type": "ready", "transfer_id": "transfer-1"}
     assert complete == {"wisp_id": "upload", "response": {"html": "<p>received</p>"}}
+    assert received_header == {
+        "type": "bulk",
+        "session_token": "wisp-session",
+        "ticket": ticket,
+        "role": "receiver",
+        "peer": "android-user",
+        "length": len(ciphertext),
+    }
     assert observed == {
         "action": {"type": "transcribe", "language": "en"},
         "name": "voice.ogg",
         "content_type": "audio/ogg",
-        "size": 11,
-        "bytes": b"hello world",
+        "size": len(plaintext),
+        "bytes": plaintext,
     }
-    assert not list((tmp_path / "uploads").glob("**/*.upload"))
-    assert "voice.ogg" not in str(writer.messages)
-    assert "hello world" not in str(writer.messages)
-
-
-def test_file_commit_rejects_incomplete_transfer_without_calling_wisp(tmp_path: Path) -> None:
-    android = generate_identity()
-    wisp_identity = generate_identity()
-    info, _ = make_info(tmp_path)
-    calls: list[WispAction] = []
-    client = AppserveClient(info, "upload-wisp", identity_key=wisp_identity, transfer_directory=tmp_path / "uploads")
-    client.register(Wisp("upload", "Upload", "", state=lambda: {"html": ""}, action=lambda action: calls.append(action) or {"html": "bad"}))
-    writer = RecordingWriter()
-    client._writer = writer  # type: ignore[assignment]
-
-    async def send(body: dict) -> dict:
-        request = encrypt_envelope(
-            sender="android-user",
-            recipient="upload-wisp",
-            message_id=f"request-{len(writer.messages)}",
-            body=body,
-            recipient_public_key=public_key_text(wisp_identity),
-            sender_private_key=android,
-            advertise_sender_key=not writer.messages,
-        )
-        await client._handle_envelope(request)
-        response, _ = decrypt_envelope(writer.messages[-1], android, public_key_text(wisp_identity))
-        return response
-
-    async def scenario() -> dict:
-        await send({
-            "wisp_id": "upload",
-            "action": "file_begin",
-            "transfer_id": "short",
-            "action_data": {"type": "upload"},
-            "files": [{"id": "f", "field": "file", "name": "x.bin", "content_type": "application/octet-stream", "size": 5}],
-        })
-        return await send({"wisp_id": "upload", "action": "file_commit", "transfer_id": "short"})
-
-    response = asyncio.run(scenario())
-
-    assert response["transfer"]["type"] == "error"
-    assert response["transfer"]["transfer_id"] == "short"
-    assert "incomplete" in response["transfer"]["error"]
-    assert calls == []
     assert not list((tmp_path / "uploads").glob("**/*.upload"))
