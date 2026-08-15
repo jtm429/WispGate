@@ -1,10 +1,12 @@
 package com.example.wispgateclient
 
 import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -59,6 +61,7 @@ import kotlinx.coroutines.coroutineScope
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        StagedFileCache.sweepOnce(cacheDir)
         enableEdgeToEdge()
         setContent {
             WispGateClientTheme {
@@ -323,7 +326,18 @@ private fun WebAppScreen(
                 WebView(context).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
-                    webViewClient = WebViewClient()
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest): Boolean {
+                            val uri = request.url
+                            if (uri.host == "wisp.local" || uri.scheme in setOf("about", "data", "blob", "javascript")) {
+                                return false
+                            }
+                            if (request.isForMainFrame && uri.scheme in setOf("http", "https")) {
+                                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri)) }
+                            }
+                            return true
+                        }
+                    }
                     webChromeClient = object : WebChromeClient() {
                         override fun onShowFileChooser(
                             webView: WebView?,
@@ -362,6 +376,11 @@ private fun WebAppScreen(
                 }
             },
             update = { view -> view.loadDataWithBaseURL("https://wisp.local/", themedHtml, "text/html", "UTF-8", null) },
+            onRelease = { view ->
+                view.removeJavascriptInterface("_WispGateNative")
+                view.stopLoading()
+                view.destroy()
+            },
         )
     }
 }

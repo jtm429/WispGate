@@ -10,6 +10,18 @@ import java.nio.file.Files
 
 class WispFileTransferTest {
     @Test
+    fun sweepsPlaintextLeftByAPreviousProcess() {
+        val root = Files.createTempDirectory("wisp-cache-test").toFile()
+        val abandoned = StagedFileCache.directory(root).resolve("abandoned").apply { mkdirs() }
+        abandoned.resolve("0.upload").writeText("plaintext")
+
+        StagedFileCache.sweepOnce(root)
+
+        assertFalse(StagedFileCache.directory(root).exists())
+        root.deleteRecursively()
+    }
+
+    @Test
     fun stagesDeclaredChunksAndCompletesOneReusableAction() {
         val root = Files.createTempDirectory("wisp-stager-test").toFile()
         val completed = mutableListOf<StagedFileAction>()

@@ -6,6 +6,20 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.RandomAccessFile
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+
+internal object StagedFileCache {
+    private const val DIRECTORY_NAME = "wispgate-file-actions"
+    private val sweptThisProcess = AtomicBoolean(false)
+
+    fun directory(cacheDirectory: File): File = cacheDirectory.resolve(DIRECTORY_NAME)
+
+    fun sweepOnce(cacheDirectory: File) {
+        if (sweptThisProcess.compareAndSet(false, true)) {
+            directory(cacheDirectory).deleteRecursively()
+        }
+    }
+}
 
 private object Base64Url {
     private const val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -84,7 +98,7 @@ class FileTransferStager(
         val manifests = JSONArray(manifestJson)
         require(manifests.length() in 1..MAX_FILES) { "A file action requires between 1 and $MAX_FILES files" }
         val transferId = UUID.randomUUID().toString()
-        val directory = cacheDirectory.resolve("wispgate-file-actions").resolve(transferId)
+        val directory = StagedFileCache.directory(cacheDirectory).resolve(transferId)
         require(directory.mkdirs()) { "Unable to create temporary upload directory" }
         val files = mutableListOf<StagedUpload>()
         var total = 0L
