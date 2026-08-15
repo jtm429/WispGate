@@ -7,6 +7,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -19,6 +21,7 @@ import java.io.OutputStreamWriter
 import java.net.Socket
 import java.security.KeyFactory
 import java.security.spec.X509EncodedKeySpec
+import java.util.UUID
 import javax.crypto.Cipher
 
 object PeerKeyPolicy {
@@ -44,6 +47,7 @@ class RelayClient(private val context: Context) {
     private val preferences = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
     private val identity by lazy { EndpointIdentity().keyPair() }
     private val controlScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val interactiveMutex = Mutex()
     private var controlSocket: Socket? = null
     private var controlJob: Job? = null
     private val _catalogUpdates = MutableSharedFlow<List<Wisp>>(replay = 1, extraBufferCapacity = 1)
@@ -148,7 +152,8 @@ class RelayClient(private val context: Context) {
         }
     }
 
-    suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = withContext(Dispatchers.IO) {
+    suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = interactiveMutex.withLock {
+        withContext(Dispatchers.IO) {
         val token = preferences.getString("session_token", null) ?: error("Connect before requesting state")
         Socket(info.host, info.relayPort).use { socket ->
             socket.soTimeout = 10_000
@@ -168,9 +173,11 @@ class RelayClient(private val context: Context) {
             val responseBody = decryptResponse(response, wisp.owner, peerKey)
             WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
         }
+        }
     }
 
-    suspend fun sendAction(info: ServerInfo, wisp: Wisp, action: String): WispState = withContext(Dispatchers.IO) {
+    suspend fun sendAction(info: ServerInfo, wisp: Wisp, action: String): WispState = interactiveMutex.withLock {
+        withContext(Dispatchers.IO) {
         val token = preferences.getString("session_token", null) ?: error("Connect before sending action")
         Socket(info.host, info.relayPort).use { socket ->
             socket.soTimeout = 10_000
@@ -187,6 +194,67 @@ class RelayClient(private val context: Context) {
             val response = input.readJson("relay response")
             val responseBody = decryptResponse(response, wisp.owner, peerKey)
             WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
+        }
+        }
+    }
+
+    suspend fun sendFileAction(info: ServerInfo, wisp: Wisp, action: StagedFileAction): WispState = interactiveMutex.withLock {
+        withContext(Dispatchers.IO) {
+        val token = preferences.getString("session_token", null) ?: error("Connect before sending an action")
+        Socket(info.host, info.relayPort).use { socket ->
+            socket.soTimeout = 30_000
+            val input = socket.reader()
+            val output = socket.writer()
+            send(output, JSONObject().put("type", "session").put("session_token", token).toString())
+            val ready = input.readJson("relay response")
+            if (!ready.optBoolean("ok")) error(ready.optString("error", "Relay session failed"))
+            val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
+
+            fun exchange(body: JSONObject, advertisePublicKey: Boolean = false): JSONObject {
+                send(output, envelope(wisp.owner, body, peerKey, advertisePublicKey))
+                val accepted = input.readJson("relay response")
+                if (!accepted.optBoolean("ok")) error(accepted.optString("error", "File action rejected"))
+                return decryptResponse(input.readJson("encrypted Wisp response"), wisp.owner, peerKey)
+            }
+
+            val begun = exchange(FileActionProtocol.begin(wisp.id, action), advertisePublicKey = true)
+            val transferReady = begun.optJSONObject("transfer") ?: error("Wisp did not accept the file action")
+            if (transferReady.optString("type") == "error") error(transferReady.optString("error", "File action rejected"))
+            if (transferReady.optString("type") != "ready" || transferReady.optString("transfer_id") != action.transferId) {
+                error("Unexpected file-transfer response")
+            }
+            val chunkSize = transferReady.optInt("chunk_size", FileTransferStager.MAX_CHUNK_BYTES)
+            require(chunkSize in 1..FileTransferStager.MAX_CHUNK_BYTES) { "Wisp requested an invalid file chunk size" }
+
+            action.files.forEach { file ->
+                file.path.inputStream().use { source ->
+                    val buffer = ByteArray(chunkSize)
+                    var offset = 0L
+                    while (true) {
+                        val count = source.read(buffer)
+                        if (count < 0) break
+                        val chunk = if (count == buffer.size) buffer else buffer.copyOf(count)
+                        val acknowledged = exchange(FileActionProtocol.chunk(wisp.id, action.transferId, file.id, offset, chunk))
+                        val transfer = acknowledged.optJSONObject("transfer") ?: error("Wisp did not acknowledge a file chunk")
+                        if (transfer.optString("type") == "error") error(transfer.optString("error", "File chunk rejected"))
+                        val nextOffset = transfer.optLong("next_offset", -1)
+                        require(
+                            transfer.optString("type") == "chunk_accepted" &&
+                                transfer.optString("file_id") == file.id &&
+                                nextOffset == offset + count
+                        ) { "Unexpected file-chunk acknowledgement" }
+                        offset = nextOffset
+                    }
+                    require(offset == file.size) { "Staged file length changed before upload" }
+                }
+            }
+
+            val completed = exchange(FileActionProtocol.commit(wisp.id, action.transferId))
+            completed.optJSONObject("transfer")?.let { transfer ->
+                if (transfer.optString("type") == "error") error(transfer.optString("error", "File action failed"))
+            }
+            WispState(wisp.id, completed.optJSONObject("response")?.optString("html", "") ?: "")
+        }
         }
     }
 
@@ -210,7 +278,7 @@ class RelayClient(private val context: Context) {
         E2EEnvelope.encrypt(
             sender = "android-user",
             recipient = recipient,
-            messageId = System.nanoTime().toString(),
+            messageId = UUID.randomUUID().toString(),
             body = body,
             recipientPublicKey = recipientPublicKey,
             senderPrivateKey = identity.private,

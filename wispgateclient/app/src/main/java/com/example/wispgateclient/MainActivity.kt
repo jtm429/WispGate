@@ -143,6 +143,16 @@ private fun WispGateApp(client: RelayClient) {
                     }
                 }
             },
+            onFileAction = { action ->
+                val upload = scope.launch {
+                    try {
+                        html = client.sendFileAction(server!!, selected!!, action).html
+                    } catch (cause: Throwable) {
+                        error = cause.message ?: "Unable to send Wisp file action"
+                    }
+                }
+                upload.invokeOnCompletion { action.cleanup() }
+            },
             onBack = { selected = null; html = null },
         )
         return
@@ -279,18 +289,28 @@ private fun SetupScreen(onSave: (String, String, String, String) -> Unit) {
 }
 
 @Composable
-private fun WebAppScreen(wisp: RelayClient.Wisp, html: String, onAction: (String) -> Unit, onBack: () -> Unit) {
+private fun WebAppScreen(
+    wisp: RelayClient.Wisp,
+    html: String,
+    onAction: (String) -> Unit,
+    onFileAction: (StagedFileAction) -> Unit,
+    onBack: () -> Unit,
+) {
     val context = LocalContext.current
     val darkTheme = isSystemInDarkTheme()
     val pendingFileChooser = remember { PendingFileChooser<Array<Uri>>() }
+    val fileTransferStager = remember(context.cacheDir) { FileTransferStager(context.cacheDir, onFileAction) }
     val fileChooserLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         pendingFileChooser.complete(WebChromeClient.FileChooserParams.parseResult(result.resultCode, result.data))
     }
     DisposableEffect(Unit) {
-        onDispose { pendingFileChooser.cancel() }
+        onDispose {
+            pendingFileChooser.cancel()
+            fileTransferStager.cancelAll()
+        }
     }
     val themedHtml = remember(html, darkTheme) {
-        WispHtmlTheme.apply(context, html, darkTheme)
+        WispHtmlRuntime.apply(WispHtmlTheme.apply(context, html, darkTheme))
     }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -324,7 +344,21 @@ private fun WebAppScreen(wisp: RelayClient.Wisp, html: String, onAction: (String
                     addJavascriptInterface(object {
                         @JavascriptInterface
                         fun submit(action: String) = onAction(action)
-                    }, "WispGate")
+
+                        @JavascriptInterface
+                        fun beginFileAction(action: String, manifest: String): String =
+                            fileTransferStager.begin(action, manifest)
+
+                        @JavascriptInterface
+                        fun appendFileChunk(transferId: String, fileId: String, offset: Long, data: String): Long =
+                            fileTransferStager.append(transferId, fileId, offset, data)
+
+                        @JavascriptInterface
+                        fun finishFileAction(transferId: String) = fileTransferStager.finish(transferId)
+
+                        @JavascriptInterface
+                        fun cancelFileAction(transferId: String) = fileTransferStager.cancel(transferId)
+                    }, "_WispGateNative")
                 }
             },
             update = { view -> view.loadDataWithBaseURL("https://wisp.local/", themedHtml, "text/html", "UTF-8", null) },

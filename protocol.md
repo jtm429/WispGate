@@ -142,6 +142,53 @@ It does not hide metadata such as connection timing, message sizes, routing IDs,
 
 The initial catalog/refresh key exchange is trust-on-first-use. A relay already compromised before the first contact could substitute both endpoint keys. For protection against that first-contact attack, compare the endpoint fingerprints through an out-of-band trusted channel before accepting them.
 
+## Generic file actions
+
+File upload is a reusable WispGate action capability rather than an app-specific Android feature. A Wisp webapp may submit an ordinary HTML form with files through the host-injected runtime:
+
+```html
+<form id="upload">
+  <input name="attachments" type="file" multiple>
+  <input name="caption">
+  <button>Send</button>
+</form>
+<script>
+upload.addEventListener("submit", event => {
+  event.preventDefault();
+  WispGate.submitForm(upload, {type: "send"});
+});
+</script>
+```
+
+The runtime collects ordinary form values, stages selected browser `File` objects in bounded chunks, and sends this encrypted sequence:
+
+```text
+file_begin(manifest with file IDs, fields, names, MIME types, and exact lengths)
+  <- ready(accepted transfer ID and maximum chunk size)
+file_chunk(file ID, exact offset, encrypted bytes)
+  <- chunk_accepted(next exact offset)
+...
+file_commit(transfer ID)
+  <- complete Wisp HTML response
+```
+
+Each message is a separately authenticated endpoint-encrypted envelope. The relay sees routing metadata and ciphertext sizes but not action fields, filenames, MIME types, or file contents. The Python runtime rejects duplicate IDs, unexpected offsets, undeclared bytes, incomplete commits, more than 32 files, or more than 256 MiB in one action. The current chunk size is 24 KiB so each encrypted line remains below the transport's bounded reader limit.
+
+The existing Python action callback remains dictionary-compatible. File-aware callbacks inspect `action.files`; one file for a form field is an `UploadedFile`, while repeated files for one field are a tuple:
+
+```python
+from appserve import WispAction
+
+def handle(action: WispAction):
+    recording = action.files["recording"]
+    with recording.open("rb") as source:
+        process(source)
+    # Use recording.save(destination) inside this callback to retain it.
+    return {"html": "<p>Received.</p>"}
+```
+
+Temporary upload files are deleted after the action callback returns. Apps choose their form fields, accepted browser MIME types, semantic action values, and application-level limits; Android and the relay contain no collector-, audio-, document-, or image-specific branches.
+
 ## Host-provided Wisp theme
 
 The Android host injects its device-matched Wisp CSS into Wisp HTML before rendering. The host applies the current light/dark system mode and keeps the CSS locally on the device; it does not request a stylesheet over the relay.
