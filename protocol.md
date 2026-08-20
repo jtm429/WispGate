@@ -45,6 +45,14 @@ After establishment, each application frame has only these relay-visible fields:
 
 Each direction has its own key and monotonically increasing sequence starting at zero. The 96-bit AES-GCM nonce is the fixed four-byte prefix `57 47 01 00` followed by the unsigned 64-bit sequence in network byte order. The complete routing object (`version`, `type`, `session_id`, `sender`, `recipient`, and `sequence`) is canonical JSON AAD. Receivers require the exact next sequence, so missing, reordered, replayed, out-of-range, route-modified, or tag-modified frames fail closed.
 
+If a recipient no longer has the referenced in-memory session, it sends an unencrypted relay-routed recovery control message:
+
+```json
+{"type":"session_reset","sender":"prime-wisp","recipient":"android-user","reason":"unknown_session"}
+```
+
+The relay validates and forwards this control message without treating it as application data. The sender invalidates its cached peer session, performs a fresh RSA session handshake, and retries the interrupted request once from the beginning. A reset never weakens long-term peer-key trust or silently accepts a changed identity.
+
 ## Turn-based applet messages
 
 Applet traffic is organized as alternating actions and responses rather than a continuously synchronized UI state:
@@ -188,6 +196,47 @@ def handle(action: WispAction):
 ```
 
 Temporary upload files are deleted after the action callback returns. Apps choose their form fields, accepted browser MIME types, semantic action values, and application-level limits; Android and the relay contain no collector-, audio-, document-, or image-specific branches.
+
+## Generic Wisp response assets
+
+A Wisp may attach files to a complete response without embedding their bytes in HTML or session JSON. The Wisp first sends an encrypted session body containing the complete response and one or more asset manifests:
+
+```json
+{
+  "wisp_id": "qr-code",
+  "response": {
+    "content_type": "text/html",
+    "html": "<img src=\"https://wisp.local/_wispgate/assets/qr-code\">"
+  },
+  "assets": {
+    "type": "begin",
+    "transfer_id": "...",
+    "files": [{
+      "id": "qr-code",
+      "name": "qr.png",
+      "content_type": "image/png",
+      "size": 12345,
+      "bulk": {
+        "algorithm": "RSA-OAEP-256+A256GCM",
+        "ticket": "...",
+        "encrypted_key": "...",
+        "nonce": "...",
+        "ciphertext_size": 12361
+      }
+    }]
+  }
+}
+```
+
+After that session frame, the Wisp and Android open matching sender and receiver connections on the existing bulk relay. The relay's bounded ticket pairing allows either side to arrive first, so no separate readiness frame is required. Each asset uses a fresh AES-256-GCM key and nonce; the key is RSA-OAEP wrapped to Android. The authenticated bulk AAD is the NUL-separated sequence `wispgate-bulk-v1`, sender, recipient, transfer ID, asset ID, ticket, and plaintext size.
+
+Android streams and authenticates each asset into app-private cache. After all bulk transfers complete, the Wisp sends:
+
+```json
+{"wisp_id":"qr-code","assets":{"type":"complete","transfer_id":"..."}}
+```
+
+Only after receiving and validating that completion does Android publish the response to the WebView. The WebView may request a declared asset at `https://wisp.local/_wispgate/assets/<asset-id>`; the native host intercepts that reserved route and streams the private cached file. Unknown asset IDs return a local error and never fall through to the network. Replacing or closing the Wisp response deletes its cached assets. IDs are restricted to URL-safe path-segment characters, and one response is bounded to 32 assets and 256 MiB total.
 
 ## Host-provided Wisp theme
 

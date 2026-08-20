@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
+import re
 import secrets
 import shutil
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, BinaryIO, Callable
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -29,6 +31,7 @@ from .e2e import (
 
 
 LOG = logging.getLogger(__name__)
+_ASSET_ID_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 
 
 @dataclass(frozen=True)
@@ -46,11 +49,45 @@ class Wisp:
     id: str
     name: str
     description: str
-    state: Callable[[], dict[str, Any]]
-    action: Callable[[dict[str, Any]], Awaitable[dict[str, Any]] | dict[str, Any]]
+    state: Callable[[], "WispResponse | dict[str, Any]"]
+    action: Callable[[dict[str, Any]], Awaitable["WispResponse | dict[str, Any]"] | "WispResponse | dict[str, Any]"]
 
     def manifest(self) -> dict[str, str]:
         return {"id": self.id, "name": self.name, "description": self.description}
+
+
+@dataclass(frozen=True)
+class WispAsset:
+    """A response asset streamed through WispGate's encrypted bulk lane."""
+
+    id: str
+    name: str
+    content_type: str
+    size: int
+    _open: Callable[[], BinaryIO]
+
+    @classmethod
+    def from_bytes(cls, id: str, name: str, content_type: str, data: bytes) -> "WispAsset":
+        value = bytes(data)
+        return cls(id, name, content_type, len(value), lambda: io.BytesIO(value))
+
+    @classmethod
+    def from_path(cls, id: str, path: str | Path, content_type: str) -> "WispAsset":
+        source = Path(path)
+        return cls(id, source.name, content_type, source.stat().st_size, lambda: source.open("rb"))
+
+    def open(self) -> BinaryIO:
+        return self._open()
+
+
+@dataclass(frozen=True)
+class WispResponse:
+    html: str
+    assets: tuple[WispAsset, ...] = ()
+    content_type: str = "text/html"
+
+    def payload(self) -> dict[str, str]:
+        return {"content_type": self.content_type, "html": self.html}
 
 
 @dataclass(frozen=True)
@@ -103,6 +140,33 @@ class _IncomingTransfer:
     task: asyncio.Task[None] | None = None
 
 
+@dataclass(frozen=True)
+class _PreparedOutboundAsset:
+    asset: WispAsset
+    transfer_id: str
+    sender: str
+    recipient: str
+    ticket: str
+    encrypted_key: str
+    nonce: str
+    content_key: bytes
+
+    @property
+    def ciphertext_size(self) -> int:
+        return self.asset.size + 16
+
+    def aad(self) -> bytes:
+        return b"\0".join([
+            b"wispgate-bulk-v1",
+            self.sender.encode(),
+            self.recipient.encode(),
+            self.transfer_id.encode(),
+            self.asset.id.encode(),
+            self.ticket.encode(),
+            str(self.asset.size).encode(),
+        ])
+
+
 class AppserveClient:
     MAX_FILES_PER_ACTION = 32
     MAX_FILE_ACTION_BYTES = 256 * 1024 * 1024
@@ -149,9 +213,9 @@ class AppserveClient:
                     raise ConnectionError("relay connection closed")
                 except asyncio.CancelledError:
                     raise
-                except (ConnectionError, OSError, asyncio.IncompleteReadError, json.JSONDecodeError) as cause:
+                except Exception as cause:
                     self._close_connection()
-                    LOG.warning("relay connection lost: %s; reconnecting in %.1fs", cause, delay)
+                    LOG.exception("Wisp runtime attempt failed; restarting from bootstrap in %.1fs: %s", delay, cause)
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 30.0)
         finally:
@@ -168,6 +232,11 @@ class AppserveClient:
                 raise ConnectionError(joined.get("error", "join failed"))
             self._session_token = joined["session_token"]
             await self._send(writer, self._registration_message())
+            registration = await asyncio.wait_for(self._read(reader), timeout=10)
+            if not registration.get("ok") or registration.get("type") != "wisps_registered":
+                raise ConnectionError(registration.get("error", "Wisp registration rejected"))
+            registered_ids = [item.get("id") for item in registration.get("items", []) if isinstance(item, dict)]
+            LOG.info("Wisp registration accepted client=%s ids=%s", self.client_id, registered_ids)
         finally:
             writer.close()
             await writer.wait_closed()
@@ -224,7 +293,27 @@ class AppserveClient:
                 try:
                     await self._handle_session_envelope(message)
                 except ValueError as cause:
-                    LOG.warning("discarding invalid peer-session frame: %s", cause)
+                    if str(cause) == "unknown session":
+                        LOG.warning("rejected unknown peer session; requested a fresh session from sender")
+                    else:
+                        LOG.warning("discarding invalid peer-session frame: %s", cause)
+            elif message.get("type") == "session_reset":
+                if message.get("recipient") != self.client_id:
+                    LOG.warning("discarding invalid session-reset route")
+                else:
+                    self._peer_sessions.pop(message.get("sender"), None)
+                    LOG.warning("peer %s requested a fresh session: %s", message.get("sender"), message.get("reason", "unknown"))
+            elif message.get("type") == "accepted":
+                # Relay transport acknowledgement. It is not Wisp application data.
+                LOG.debug("relay accepted forwarded message type=%s", message.get("message_type", "session_envelope"))
+            elif message.get("type") is None and message.get("ok") is True:
+                # Compatibility with relays that acknowledge a forwarded control packet
+                # using the original success-only response shape.
+                LOG.debug("relay accepted forwarded message (legacy acknowledgement)")
+            elif message.get("type") is None and message.get("ok") is False:
+                LOG.warning("relay rejected forwarded message: %s", message.get("error", "unknown error"))
+            else:
+                LOG.warning("discarding unknown relay message type: %s", message.get("type"))
 
     def peer_public_key(self, client_id: str) -> str | None:
         return self._peer_keys.get(client_id)
@@ -278,6 +367,7 @@ class AppserveClient:
         sender = message.get("sender")
         session = self._peer_sessions.get(sender)
         if session is None:
+            await self._send_session_reset(sender, "unknown_session")
             raise ValueError("unknown session")
         try:
             body = session.decrypt(message, now=time.monotonic())
@@ -285,6 +375,16 @@ class AppserveClient:
             self._peer_sessions.pop(sender, None)
             raise ValueError(str(cause)) from cause
         await self._dispatch_session_body(sender, body)
+
+    async def _send_session_reset(self, recipient: str, reason: str) -> None:
+        if not self._writer:
+            return
+        await self._send(self._writer, {
+            "type": "session_reset",
+            "sender": self.client_id,
+            "recipient": recipient,
+            "reason": reason,
+        })
 
     async def _dispatch_session_body(self, sender: str, body: dict[str, Any]) -> None:
         self._expire_file_transfers()
@@ -294,7 +394,6 @@ class AppserveClient:
         action_kind = body.get("action")
         if action_kind == "state_request":
             state = wisp.state()
-            response = {"wisp_id": wisp.id, "response": state}
         elif action_kind == "file_begin":
             transfer_id = str(body.get("transfer_id", ""))
             try:
@@ -316,8 +415,7 @@ class AppserveClient:
         else:
             result = wisp.action(WispAction(body.get("action_data", {})))
             state = await result if asyncio.iscoroutine(result) else result
-            response = {"wisp_id": wisp.id, "response": state}
-        await self._send_session(sender, response)
+        await self._send_wisp_response(sender, wisp, state)
 
     def _transfer_response(self, wisp: Wisp, transfer: dict[str, Any]) -> dict[str, Any]:
         return {"wisp_id": wisp.id, "transfer": transfer}
@@ -411,7 +509,8 @@ class AppserveClient:
                 }
                 result = transfer.wisp.action(WispAction(transfer.action_data, exposed))
                 state = await result if asyncio.iscoroutine(result) else result
-                response = {"wisp_id": transfer.wisp.id, "response": state}
+                await self._send_wisp_response(transfer.sender, transfer.wisp, state)
+                return
             except asyncio.CancelledError:
                 raise
             except Exception as cause:
@@ -494,6 +593,141 @@ class AppserveClient:
         for key in expired:
             self._cleanup_transfer(self._transfers.pop(key))
 
+    async def _send_wisp_response(
+        self,
+        recipient: str,
+        wisp: Wisp,
+        state: WispResponse | dict[str, Any],
+    ) -> None:
+        if not isinstance(state, WispResponse) or not state.assets:
+            payload = state.payload() if isinstance(state, WispResponse) else state
+            await self._send_session(recipient, {"wisp_id": wisp.id, "response": payload})
+            return
+
+        prepared = self._prepare_outbound_assets(recipient, state.assets)
+        transfer_id = prepared[0].transfer_id
+        files = [
+            {
+                "id": item.asset.id,
+                "name": item.asset.name,
+                "content_type": item.asset.content_type,
+                "size": item.asset.size,
+                "bulk": {
+                    "algorithm": "RSA-OAEP-256+A256GCM",
+                    "ticket": item.ticket,
+                    "encrypted_key": item.encrypted_key,
+                    "nonce": item.nonce,
+                    "ciphertext_size": item.ciphertext_size,
+                },
+            }
+            for item in prepared
+        ]
+        await self._send_session(
+            recipient,
+            {
+                "wisp_id": wisp.id,
+                "response": state.payload(),
+                "assets": {"type": "begin", "transfer_id": transfer_id, "files": files},
+            },
+        )
+        for item in prepared:
+            await self._send_outbound_asset(item)
+        await self._send_session(
+            recipient,
+            {"wisp_id": wisp.id, "assets": {"type": "complete", "transfer_id": transfer_id}},
+        )
+
+    def _prepare_outbound_assets(
+        self,
+        recipient: str,
+        assets: tuple[WispAsset, ...],
+    ) -> list[_PreparedOutboundAsset]:
+        if not 1 <= len(assets) <= self.MAX_FILES_PER_ACTION:
+            raise ValueError("a Wisp response must contain between 1 and 32 assets")
+        if any(type(asset.size) is not int for asset in assets):
+            raise ValueError("invalid Wisp response asset")
+        if sum(asset.size for asset in assets) > self.MAX_FILE_ACTION_BYTES:
+            raise ValueError("Wisp response assets exceed the configured size limit")
+        ids: set[str] = set()
+        for asset in assets:
+            if (
+                not _ASSET_ID_PATTERN.fullmatch(asset.id) or asset.id in {".", ".."}
+                or len(asset.id) > 128 or asset.id in ids
+                or not asset.name or len(asset.name) > 512
+                or not asset.content_type or len(asset.content_type) > 128
+                or asset.size < 0
+            ):
+                raise ValueError("invalid Wisp response asset")
+            ids.add(asset.id)
+        peer_text = self._peer_keys.get(recipient)
+        if not peer_text:
+            raise ValueError(f"no trusted public key for {recipient}")
+        peer_key = serialization.load_der_public_key(
+            base64.urlsafe_b64decode(peer_text + "=" * (-len(peer_text) % 4))
+        )
+        transfer_id = secrets.token_urlsafe(18)
+        prepared: list[_PreparedOutboundAsset] = []
+        for asset in assets:
+            content_key = secrets.token_bytes(32)
+            nonce = secrets.token_bytes(12)
+            ticket = secrets.token_urlsafe(24)
+            wrapped = peer_key.encrypt(
+                content_key,
+                padding.OAEP(mgf=padding.MGF1(hashes.SHA1()), algorithm=hashes.SHA256(), label=None),
+            )
+            prepared.append(
+                _PreparedOutboundAsset(
+                    asset,
+                    transfer_id,
+                    self.client_id,
+                    recipient,
+                    ticket,
+                    base64.urlsafe_b64encode(wrapped).decode().rstrip("="),
+                    base64.urlsafe_b64encode(nonce).decode().rstrip("="),
+                    content_key,
+                )
+            )
+        return prepared
+
+    async def _send_outbound_asset(self, item: _PreparedOutboundAsset) -> None:
+        if not self._session_token:
+            raise ValueError("no relay session is available for bulk transfer")
+        reader, writer = await asyncio.open_connection(self.info.host, self.info.bulk_port)
+        try:
+            await self._send(
+                writer,
+                {
+                    "type": "bulk",
+                    "session_token": self._session_token,
+                    "ticket": item.ticket,
+                    "role": "sender",
+                    "peer": item.recipient,
+                    "length": item.ciphertext_size,
+                },
+            )
+            ready = await self._read(reader)
+            if not ready.get("ok") or ready.get("type") != "bulk_ready":
+                raise ConnectionError(ready.get("error", "bulk relay rejected transfer"))
+            nonce = base64.urlsafe_b64decode(item.nonce + "=" * (-len(item.nonce) % 4))
+            encryptor = Cipher(algorithms.AES(item.content_key), modes.GCM(nonce)).encryptor()
+            encryptor.authenticate_additional_data(item.aad())
+            plaintext_size = 0
+            with item.asset.open() as source:
+                while chunk := source.read(256 * 1024):
+                    plaintext_size += len(chunk)
+                    writer.write(encryptor.update(chunk))
+                    await writer.drain()
+            if plaintext_size != item.asset.size:
+                raise ValueError("asset length changed during transfer")
+            writer.write(encryptor.finalize() + encryptor.tag)
+            await writer.drain()
+            complete = await self._read(reader)
+            if not complete.get("ok") or complete.get("type") != "bulk_complete":
+                raise ConnectionError(complete.get("error", "bulk relay did not complete transfer"))
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
     async def _send_envelope(self, recipient: str, body: dict[str, Any]) -> None:
         assert self._writer is not None
         recipient_key = self._peer_keys.get(recipient)
@@ -545,13 +779,15 @@ class AppserveClient:
         return json.loads(await reader.readline())
 
 
-def load(path: str | Path) -> AppserveClient:
+def load(path: str | Path, *, reset_peer_trust: bool = False) -> AppserveClient:
     config_path = Path(path)
     data = json.loads(config_path.read_text(encoding="utf-8"))
     key = data["server_public_key"]
     client_id = data.get("client_id", "python-wisp")
     identity_path = config_path.with_name(f".{config_path.stem}-{client_id}-identity.pem")
     peers_path = config_path.with_name(f".{config_path.stem}-{client_id}-peers.json")
+    if reset_peer_trust:
+        peers_path.unlink(missing_ok=True)
     return AppserveClient(
         ServerInfo(
             host=data["server"],

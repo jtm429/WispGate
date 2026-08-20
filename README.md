@@ -20,6 +20,7 @@ appserve.load("serverinfo.txt")
 
 ## Documents
 
+- [WispGate implementation guide](WISPGATE_IMPLEMENTATION_GUIDE.md) — step-by-step instructions for adding a Wisp interface to a Python program
 - [User client specification](user-client.md)
 - [Webapp client specification](webapp-client.md)
 - [Relay server specification](relay-server.md)

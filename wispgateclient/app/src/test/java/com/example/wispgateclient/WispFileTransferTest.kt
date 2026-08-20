@@ -4,9 +4,16 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.file.Files
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 
 class WispFileTransferTest {
     @Test
@@ -262,5 +269,224 @@ class WispFileTransferTest {
         assertEquals("hello", String(decrypt.doFinal(encrypted)))
         assertFalse(begin.toString().contains("file_chunk"))
         action.cleanup()
+    }
+
+    @Test
+    fun receivesAndAuthenticatesWispAssetIntoLocalCache() {
+        val plaintext = ByteArray(1024 * 1024) { (it % 251).toByte() }
+        val identity = java.security.KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val contentKey = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }.generateKey().encoded
+        val nonce = ByteArray(12) { it.toByte() }
+        val transferId = "asset-transfer"
+        val ticket = "asset-ticket-1234567890"
+        val fileId = "qr-code"
+        val wrapped = javax.crypto.Cipher.getInstance("RSA/ECB/OAEPPadding").apply {
+            init(javax.crypto.Cipher.ENCRYPT_MODE, identity.public, E2EEnvelope.oaepParameters())
+        }.doFinal(contentKey)
+        val offer = InboundAssetOffer.fromJson(
+            transferId,
+            JSONObject()
+                .put("id", fileId)
+                .put("name", "qr.png")
+                .put("content_type", "image/png")
+                .put("size", plaintext.size)
+                .put(
+                    "bulk",
+                    JSONObject()
+                        .put("algorithm", "RSA-OAEP-256+A256GCM")
+                        .put("ticket", ticket)
+                        .put("encrypted_key", java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(wrapped))
+                        .put("nonce", java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(nonce))
+                        .put("ciphertext_size", plaintext.size + 16),
+                ),
+        )
+        val encrypt = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding").apply {
+            init(
+                javax.crypto.Cipher.ENCRYPT_MODE,
+                javax.crypto.spec.SecretKeySpec(contentKey, "AES"),
+                javax.crypto.spec.GCMParameterSpec(128, nonce),
+            )
+            updateAAD(offer.aad("wisp-owner", "android-user"))
+        }
+        val ciphertext = encrypt.doFinal(plaintext)
+        val server = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())
+        val receivedHeader = java.util.concurrent.atomic.AtomicReference<JSONObject>()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        val serverTask = executor.submit {
+            server.accept().use { socket ->
+                val input = socket.getInputStream()
+                val headerBytes = java.io.ByteArrayOutputStream()
+                while (true) {
+                    val next = input.read()
+                    require(next >= 0)
+                    if (next == '\n'.code) break
+                    headerBytes.write(next)
+                }
+                receivedHeader.set(JSONObject(headerBytes.toString(Charsets.UTF_8.name())))
+                socket.getOutputStream().write("{\"ok\":true,\"type\":\"bulk_ready\"}\n".toByteArray())
+                socket.getOutputStream().write(ciphertext)
+                socket.getOutputStream().flush()
+            }
+        }
+        val directory = Files.createTempDirectory("wisp-asset-receive-test").toFile()
+
+        val received = BulkSocketTransport.receive(
+            host = java.net.InetAddress.getLoopbackAddress().hostAddress!!,
+            port = server.localPort,
+            sender = "wisp-owner",
+            recipient = "android-user",
+            sessionToken = "android-session-token",
+            offer = offer,
+            privateKey = identity.private,
+            directory = directory,
+        )
+        serverTask.get(5, java.util.concurrent.TimeUnit.SECONDS)
+        executor.shutdownNow()
+        server.close()
+
+        assertEquals("qr-code", received.id)
+        assertEquals("image/png", received.contentType)
+        assertTrue(received.path.readBytes().contentEquals(plaintext))
+        assertEquals(
+            JSONObject()
+                .put("type", "bulk")
+                .put("session_token", "android-session-token")
+                .put("ticket", ticket)
+                .put("role", "receiver")
+                .put("peer", "wisp-owner")
+                .put("length", plaintext.size + 16)
+                .toString(),
+            receivedHeader.get().toString(),
+        )
+        directory.deleteRecursively()
+    }
+
+    @Test
+    fun resolvesOnlyDeclaredWispAssetUrlsForWebViewRendering() {
+        val directory = Files.createTempDirectory("wisp-asset-url-test").toFile()
+        val path = directory.resolve("opaque.asset").apply { writeText("image") }
+        val asset = ReceivedAsset("qr-code", "qr.png", "image/png", path.length(), path)
+        val state = RelayClient.WispState("qr", "<img>", mapOf(asset.id to asset), directory)
+
+        assertTrue(state.assetForUrl("https://wisp.local/_wispgate/assets/qr-code") === asset)
+        assertEquals(null, state.assetForUrl("https://wisp.local/_wispgate/assets/missing"))
+        assertEquals(null, state.assetForUrl("https://example.com/_wispgate/assets/qr-code"))
+        assertTrue(state.isWispLocalUrl("https://wisp.local/other"))
+        assertTrue(state.isWispLocalUrl("https://WISP.LOCAL/other"))
+        assertFalse(state.isWispLocalUrl("https://example.com/other"))
+
+        state.cleanup()
+        assertFalse(directory.exists())
+    }
+
+    @Test
+    fun parsesAssetBeginResponseWithoutEmbeddingFileBytesInHtml() {
+        val body = JSONObject()
+            .put("wisp_id", "qr")
+            .put("response", JSONObject().put("html", "<img src='https://wisp.local/_wispgate/assets/qr-code'>"))
+            .put(
+                "assets",
+                JSONObject()
+                    .put("type", "begin")
+                    .put("transfer_id", "transfer-1")
+                    .put(
+                        "files",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("id", "qr-code")
+                                .put("name", "qr.png")
+                                .put("content_type", "image/png")
+                                .put("size", 100)
+                                .put(
+                                    "bulk",
+                                    JSONObject()
+                                        .put("algorithm", "RSA-OAEP-256+A256GCM")
+                                        .put("ticket", "ticket-1234567890")
+                                        .put("encrypted_key", "wrapped")
+                                        .put("nonce", "nonce")
+                                        .put("ciphertext_size", 116),
+                                ),
+                        ),
+                    ),
+            )
+
+        val parsed = InboundAssetProtocol.parse(body)
+
+        assertEquals("qr", parsed.wispId)
+        assertTrue(parsed.html.contains("/_wispgate/assets/qr-code"))
+        assertEquals("transfer-1", parsed.transferId)
+        assertEquals("qr-code", parsed.offers.single().id)
+    }
+
+    @Test
+    fun rejectsWispAssetIdsThatAreNotSafeUrlSegments() {
+        val value = JSONObject()
+            .put("name", "qr.png")
+            .put("content_type", "image/png")
+            .put("size", 3)
+            .put(
+                "bulk",
+                JSONObject()
+                    .put("algorithm", "RSA-OAEP-256+A256GCM")
+                    .put("ticket", "ticket-1234567890")
+                    .put("encrypted_key", "wrapped")
+                    .put("nonce", "nonce")
+                    .put("ciphertext_size", 19),
+            )
+
+        listOf("../qr", "..", "qr%2Fcode").forEach { unsafeId ->
+            value.put("id", unsafeId)
+            assertThrows(IllegalArgumentException::class.java) {
+                InboundAssetOffer.fromJson("transfer-1", value)
+            }
+        }
+    }
+
+    @Test
+    fun bulkTransferResultQueueRetainsOneResultForExactlyOneConsumer() = runBlocking {
+        val queue = BulkTransferResultQueue()
+        val result = BulkTransferResult("transfer-1", "qr", error = "done")
+
+        assertTrue(queue.publish(result))
+        assertTrue(queue.results.first() === result)
+    }
+
+    @Test
+    fun relayOperationsAreSerializedAcrossClientInstances() = runBlocking {
+        var active = 0
+        var maximumActive = 0
+
+        coroutineScope {
+            List(2) {
+                async {
+                    RelayOperationCoordinator.serialized {
+                        active += 1
+                        maximumActive = maxOf(maximumActive, active)
+                        delay(25)
+                        active -= 1
+                    }
+                }
+            }.awaitAll()
+        }
+
+        assertEquals(1, maximumActive)
+    }
+
+    @Test
+    fun wispStateOwnerSynchronouslyCleansEveryReplacedIntermediateState() {
+        val firstDirectory = Files.createTempDirectory("wisp-state-first").toFile()
+        val secondDirectory = Files.createTempDirectory("wisp-state-second").toFile()
+        val first = RelayClient.WispState("qr", "first", assetDirectory = firstDirectory)
+        val second = RelayClient.WispState("qr", "second", assetDirectory = secondDirectory)
+        val owner = WispStateOwner()
+
+        owner.replace(first)
+        owner.replace(second)
+
+        assertFalse(firstDirectory.exists())
+        assertTrue(secondDirectory.exists())
+
+        owner.clear()
+        assertFalse(secondDirectory.exists())
     }
 }

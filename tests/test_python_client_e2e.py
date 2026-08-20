@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from pathlib import Path
 
 from appserve.client import AppserveClient, ServerInfo, Wisp, WispAction
@@ -87,6 +88,55 @@ def test_python_wisp_registration_supplies_real_endpoint_public_key(tmp_path: Pa
     registration = client._registration_message()
 
     assert registration["client_public_key"] == public_key_text(identity)
+
+
+def test_event_loop_accepts_legacy_success_ack_without_unknown_type_warning(tmp_path: Path, caplog) -> None:
+    identity = generate_identity()
+    info, _ = make_info(tmp_path)
+    client = AppserveClient(info, "prime-wisp", identity_key=identity)
+    async def scenario() -> None:
+        reader = asyncio.StreamReader()
+        reader.feed_data(b'{"ok":true}\n')
+        reader.feed_eof()
+        client._reader = reader
+        await client._event_loop()
+
+    with caplog.at_level(logging.WARNING, logger="appserve.client"):
+        asyncio.run(scenario())
+
+    assert "discarding unknown relay message type" not in caplog.text
+
+
+def test_unknown_peer_session_requests_reset(tmp_path: Path) -> None:
+    identity = generate_identity()
+    info, _ = make_info(tmp_path)
+    client = AppserveClient(info, "prime-wisp", identity_key=identity)
+    writer = RecordingWriter()
+    client._writer = writer  # type: ignore[assignment]
+    stale = {
+        "version": 1,
+        "type": "session_envelope",
+        "session_id": "stale-session",
+        "sender": "android-user",
+        "recipient": "prime-wisp",
+        "sequence": 0,
+        "ciphertext": "ignored-before-decryption",
+    }
+
+    async def scenario() -> None:
+        try:
+            await client._handle_session_envelope(stale)
+        except ValueError as cause:
+            assert str(cause) == "unknown session"
+
+    asyncio.run(scenario())
+
+    assert writer.messages == [{
+        "type": "session_reset",
+        "sender": "prime-wisp",
+        "recipient": "android-user",
+        "reason": "unknown_session",
+    }]
 
 
 def test_python_wisp_decrypts_first_refresh_and_encrypts_response(tmp_path: Path) -> None:

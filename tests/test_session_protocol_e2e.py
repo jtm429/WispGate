@@ -118,7 +118,13 @@ def test_invalid_session_frame_does_not_drop_wisp_identity_connection() -> None:
 
     asyncio.run(client._event_loop())
 
-    assert len(writer.messages) == 1
-    accepted, _ = decrypt_envelope(writer.messages[0], android, public_key_text(wisp_key))
+    assert writer.messages[0] == {
+        "type": "session_reset",
+        "sender": "prime-wisp",
+        "recipient": "android-user",
+        "reason": "unknown_session",
+    }
+    assert len(writer.messages) == 2
+    accepted, _ = decrypt_envelope(writer.messages[1], android, public_key_text(wisp_key))
     assert accepted["type"] == "session_accept"
     assert accepted["session_id"] == "replacement"

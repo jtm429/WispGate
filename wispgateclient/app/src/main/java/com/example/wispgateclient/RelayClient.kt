@@ -18,9 +18,11 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.BufferedWriter
+import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.Socket
+import java.net.URI
 import java.security.KeyFactory
 import java.security.MessageDigest
 import java.security.spec.X509EncodedKeySpec
@@ -35,6 +37,13 @@ object PeerKeyPolicy {
     }
 }
 
+internal object RelayOperationCoordinator {
+    private val mutex = Mutex()
+    val peerSessions = mutableMapOf<String, PeerSession>()
+
+    suspend fun <T> serialized(block: suspend () -> T): T = mutex.withLock { block() }
+}
+
 class RelayClient(private val context: Context) {
     data class ServerInfo(
         val host: String,
@@ -44,15 +53,35 @@ class RelayClient(private val context: Context) {
         val bulkPort: Int = 4444,
     )
     data class Wisp(val id: String, val name: String, val description: String, val owner: String, val publicKey: String)
-    data class WispState(val wispId: String, val html: String)
+    data class WispState(
+        val wispId: String,
+        val html: String,
+        val assets: Map<String, ReceivedAsset> = emptyMap(),
+        private val assetDirectory: File? = null,
+    ) {
+        fun assetForUrl(url: String): ReceivedAsset? = runCatching {
+            val uri = URI(url)
+            if (uri.scheme != "https" || uri.host != "wisp.local") return null
+            val prefix = "/_wispgate/assets/"
+            if (!uri.path.startsWith(prefix)) return null
+            val id = uri.path.removePrefix(prefix)
+            if (id.isBlank() || id.contains('/')) null else assets[id]
+        }.getOrNull()
+
+        fun isWispLocalUrl(url: String): Boolean = runCatching {
+            URI(url).host?.equals("wisp.local", ignoreCase = true) == true
+        }.getOrDefault(false)
+
+        fun cleanup() {
+            assetDirectory?.deleteRecursively()
+        }
+    }
 
     data class ConnectionResult(val wisps: List<Wisp>, val sessionToken: String)
 
     private val preferences = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
     private val identity by lazy { EndpointIdentity().keyPair() }
     private val controlScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val interactiveMutex = Mutex()
-    private val peerSessions = mutableMapOf<String, PeerSession>()
     private var controlSocket: Socket? = null
     private var controlJob: Job? = null
     private val _catalogUpdates = MutableSharedFlow<List<Wisp>>(replay = 1, extraBufferCapacity = 1)
@@ -159,7 +188,7 @@ class RelayClient(private val context: Context) {
         }
     }
 
-    suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = interactiveMutex.withLock {
+    suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = RelayOperationCoordinator.serialized {
         retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
             withContext(Dispatchers.IO) {
                 val token = preferences.getString("session_token", null) ?: error("Connect before requesting state")
@@ -174,13 +203,13 @@ class RelayClient(private val context: Context) {
                     val responseBody = exchangeSessionFrame(
                         input, output, peerSession, body, "Request rejected", "Wisp state response",
                     )
-                    WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
+                    receiveWispState(info, wisp, token, input, peerSession, responseBody)
                 }
             }
         }
     }
 
-    suspend fun sendAction(info: ServerInfo, wisp: Wisp, action: String): WispState = interactiveMutex.withLock {
+    suspend fun sendAction(info: ServerInfo, wisp: Wisp, action: String): WispState = RelayOperationCoordinator.serialized {
         retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
             withContext(Dispatchers.IO) {
                 val token = preferences.getString("session_token", null) ?: error("Connect before sending action")
@@ -196,13 +225,13 @@ class RelayClient(private val context: Context) {
                     val responseBody = exchangeSessionFrame(
                         input, output, peerSession, body, "Action rejected", "Wisp action response",
                     )
-                    WispState(wisp.id, responseBody.optJSONObject("response")?.optString("html", "") ?: "")
+                    receiveWispState(info, wisp, token, input, peerSession, responseBody)
                 }
             }
         }
     }
 
-    suspend fun sendFileAction(info: ServerInfo, wisp: Wisp, action: StagedFileAction): WispState = interactiveMutex.withLock {
+    suspend fun sendFileAction(info: ServerInfo, wisp: Wisp, action: StagedFileAction): WispState = RelayOperationCoordinator.serialized {
         retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
             withContext(Dispatchers.IO) {
                 Log.i("WispFileTransfer", "sending begin transfer=${action.transferId} files=${action.files.size}")
@@ -243,9 +272,51 @@ class RelayClient(private val context: Context) {
                         if (transfer.optString("type") == "error") error(transfer.optString("error", "File action failed"))
                     }
                     Log.i("WispFileTransfer", "bulk action accepted transfer=${action.transferId}")
-                    WispState(wisp.id, completed.optJSONObject("response")?.optString("html", "") ?: "")
+                    receiveWispState(info, wisp, token, input, peerSession, completed)
                 }
             }
+        }
+    }
+
+    private fun receiveWispState(
+        info: ServerInfo,
+        wisp: Wisp,
+        sessionToken: String,
+        input: BufferedReader,
+        peerSession: PeerSession,
+        body: JSONObject,
+    ): WispState {
+        val assets = body.optJSONObject("assets")
+        if (assets == null) {
+            return WispState(wisp.id, body.optJSONObject("response")?.optString("html", "") ?: "")
+        }
+        val parsed = InboundAssetProtocol.parse(body)
+        require(parsed.wispId == wisp.id) { "Wisp asset response used the wrong Wisp id" }
+        val directory = StagedFileCache.directory(context.cacheDir).resolve("received-${UUID.randomUUID()}")
+        return try {
+            val received = parsed.offers.associate { offer ->
+                val asset = BulkSocketTransport.receive(
+                    host = info.host,
+                    port = info.bulkPort,
+                    sender = wisp.owner,
+                    recipient = "android-user",
+                    sessionToken = sessionToken,
+                    offer = offer,
+                    privateKey = identity.private,
+                    directory = directory,
+                )
+                asset.id to asset
+            }
+            val completion = readSessionResponse(input, peerSession, "Wisp asset completion")
+                .getJSONObject("assets")
+            require(
+                completion.getString("type") == "complete" &&
+                    completion.getString("transfer_id") == parsed.transferId
+            ) { "Unexpected Wisp asset completion" }
+            WispState(parsed.wispId, parsed.html, received, directory)
+        } catch (cause: Throwable) {
+            directory.deleteRecursively()
+            throw cause
         }
     }
 
@@ -301,7 +372,7 @@ class RelayClient(private val context: Context) {
         }
 
     private fun invalidatePeerSession(owner: String) {
-        peerSessions.keys.removeAll { it.startsWith("$owner:") }
+        RelayOperationCoordinator.peerSessions.keys.removeAll { it.startsWith("$owner:") }
     }
 
     private fun sessionFor(
@@ -314,15 +385,15 @@ class RelayClient(private val context: Context) {
             .digest(SessionCrypto.decode64(peerPublicKey)).joinToString("") { "%02x".format(it) }
         val cacheKey = "$owner:$fingerprint"
         val now = SystemClock.elapsedRealtime()
-        peerSessions[cacheKey]?.takeUnless { it.isExpired(now) }?.let { return it }
-        peerSessions.keys.removeAll { it.startsWith("$owner:") }
+        RelayOperationCoordinator.peerSessions[cacheKey]?.takeUnless { it.isExpired(now) }?.let { return it }
+        RelayOperationCoordinator.peerSessions.keys.removeAll { it.startsWith("$owner:") }
         val pending = SessionHandshake.begin(owner, peerPublicKey, identity, now)
         send(output, pending.envelope.toString())
         val accepted = input.readJson("session handshake relay acceptance")
         if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Session handshake rejected"))
         val acceptance = input.readJson("authenticated Wisp session acceptance")
         return SessionHandshake.finish(pending, acceptance, SystemClock.elapsedRealtime()).also {
-            peerSessions[cacheKey] = it
+            RelayOperationCoordinator.peerSessions[cacheKey] = it
         }
     }
 
@@ -345,4 +416,17 @@ class RelayClient(private val context: Context) {
 
     private fun Socket.reader() = BufferedReader(InputStreamReader(getInputStream()))
     private fun Socket.writer() = BufferedWriter(OutputStreamWriter(getOutputStream()))
+}
+
+internal class WispStateOwner {
+    private var current: RelayClient.WispState? = null
+
+    fun replace(next: RelayClient.WispState?) {
+        if (current === next) return
+        val previous = current
+        current = next
+        previous?.cleanup()
+    }
+
+    fun clear() = replace(null)
 }

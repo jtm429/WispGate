@@ -15,8 +15,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 
 data class BulkTransferJob(
@@ -38,9 +38,16 @@ object BulkTransferJobs {
 data class BulkTransferResult(
     val transferId: String,
     val wispId: String,
-    val html: String? = null,
+    val state: RelayClient.WispState? = null,
     val error: String? = null,
 )
+
+class BulkTransferResultQueue {
+    private val channel = Channel<BulkTransferResult>(Channel.UNLIMITED)
+    val results = channel.receiveAsFlow()
+
+    fun publish(result: BulkTransferResult): Boolean = channel.trySend(result).isSuccess
+}
 
 /** Keeps the service alive until the last concurrently started transfer releases ownership. */
 class BulkTransferOwnership {
@@ -87,8 +94,12 @@ class BulkTransferService : Service() {
         private const val CHANNEL_ID = "wispgate-transfers"
         private const val NOTIFICATION_ID = 7001
         private const val EXTRA_TRANSFER_ID = "transfer_id"
-        private val _results = MutableSharedFlow<BulkTransferResult>(extraBufferCapacity = 16)
-        val results = _results.asSharedFlow()
+        private val resultQueue = BulkTransferResultQueue()
+        val results = resultQueue.results
+
+        private fun publishResult(result: BulkTransferResult) {
+            if (!resultQueue.publish(result)) result.state?.cleanup()
+        }
 
         fun enqueue(context: Context, job: BulkTransferJob) {
             BulkTransferJobs.put(job)
@@ -149,9 +160,9 @@ class BulkTransferService : Service() {
                 ) {
                     RelayClient(applicationContext).sendFileAction(job.server, job.wisp, job.action)
                 }
-                _results.emit(BulkTransferResult(job.action.transferId, job.wisp.id, html = state.html))
+                publishResult(BulkTransferResult(job.action.transferId, job.wisp.id, state = state))
             } catch (cause: Throwable) {
-                _results.emit(
+                publishResult(
                     BulkTransferResult(
                         job.action.transferId,
                         job.wisp.id,

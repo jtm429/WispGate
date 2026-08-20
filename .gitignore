@@ -9,6 +9,7 @@ server-secrets/
 keys/
 state/
 .cache/
+examples/models/
 .DS_Store
 Thumbs.db
 serverinfo.txt

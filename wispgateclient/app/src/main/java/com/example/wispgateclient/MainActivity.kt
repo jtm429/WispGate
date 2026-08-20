@@ -8,6 +8,7 @@ import android.util.Log
 import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -55,6 +56,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.wispgateclient.ui.theme.WispGateClientTheme
+import java.io.ByteArrayInputStream
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.coroutineScope
 
@@ -84,7 +86,8 @@ private fun WispGateApp(client: RelayClient) {
     var server by remember { mutableStateOf(client.savedServer()) }
     var wisps by remember { mutableStateOf<List<RelayClient.Wisp>>(emptyList()) }
     var selected by remember { mutableStateOf<RelayClient.Wisp?>(null) }
-    var html by remember { mutableStateOf<String?>(null) }
+    var wispState by remember { mutableStateOf<RelayClient.WispState?>(null) }
+    val wispStateOwner = remember { WispStateOwner() }
     var error by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(false) }
     var connected by remember { mutableStateOf(false) }
@@ -92,11 +95,28 @@ private fun WispGateApp(client: RelayClient) {
     var updatingServer by remember { mutableStateOf(false) }
     var updateMessage by remember { mutableStateOf<String?>(null) }
 
+    fun replaceWispState(next: RelayClient.WispState?) {
+        wispState = next
+        wispStateOwner.replace(next)
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { wispStateOwner.clear() }
+    }
+
     LaunchedEffect(Unit) {
         BulkTransferService.results.collect { result ->
-            if (selected?.id != result.wispId) return@collect
-            result.html?.let { html = it }
-            result.error?.let { error = it }
+            var accepted = false
+            try {
+                if (selected?.id != result.wispId) return@collect
+                result.state?.let {
+                    replaceWispState(it)
+                    accepted = true
+                }
+                result.error?.let { error = it }
+            } finally {
+                if (!accepted) result.state?.cleanup()
+            }
         }
     }
 
@@ -137,21 +157,21 @@ private fun WispGateApp(client: RelayClient) {
                 server = info
                 settingsOpen = false
                 selected = null
-                html = null
+                replaceWispState(null)
             },
             onCancel = { settingsOpen = false },
         )
         return
     }
 
-    if (selected != null && html != null) {
+    if (selected != null && wispState != null) {
         WebAppScreen(
             wisp = selected!!,
-            html = html!!,
+            state = wispState!!,
             onAction = { action ->
                 scope.launch {
                     try {
-                        html = client.sendAction(server!!, selected!!, action).html
+                        replaceWispState(client.sendAction(server!!, selected!!, action))
                     } catch (cause: Throwable) {
                         error = cause.message ?: "Unable to send Wisp action"
                     }
@@ -169,7 +189,7 @@ private fun WispGateApp(client: RelayClient) {
                     error = cause.message ?: "Unable to queue Wisp file action"
                 }
             },
-            onBack = { selected = null; html = null },
+            onBack = { selected = null; replaceWispState(null) },
         )
         return
     }
@@ -258,7 +278,7 @@ private fun WispGateApp(client: RelayClient) {
                             selected = wisp
                             scope.launch {
                                 try {
-                                    html = client.requestState(server!!, wisp).html
+                                    replaceWispState(client.requestState(server!!, wisp))
                                 } catch (cause: Throwable) {
                                     Log.e("WispGate", "Unable to request Wisp state", cause)
                                     error = cause.message ?: "Unable to request Wisp state"
@@ -314,7 +334,7 @@ private fun SetupScreen(onSave: (String, String, String, String, String) -> Unit
 @Composable
 private fun WebAppScreen(
     wisp: RelayClient.Wisp,
-    html: String,
+    state: RelayClient.WispState,
     onAction: (String) -> Unit,
     onFileAction: (StagedFileAction) -> Unit,
     onBack: () -> Unit,
@@ -332,24 +352,43 @@ private fun WebAppScreen(
             fileTransferStager.cancelAll()
         }
     }
-    val themedHtml = remember(html, darkTheme) {
-        WispHtmlRuntime.apply(WispHtmlTheme.apply(context, html, darkTheme))
+    val themedHtml = remember(state.html, darkTheme) {
+        WispHtmlRuntime.apply(WispHtmlTheme.apply(context, state.html, darkTheme))
     }
     Column(Modifier.fillMaxSize().safeDrawingPadding()) {
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Button(onClick = onBack) { Text("Back") }
             Text(wisp.name, Modifier.padding(start = 12.dp), style = MaterialTheme.typography.titleLarge)
         }
-        AndroidView(
+        androidx.compose.runtime.key(state) {
+            AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { context ->
                 WebView(context).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest): WebResourceResponse? {
+                            val uri = request.url
+                            if (!state.isWispLocalUrl(uri.toString())) return null
+                            if (uri.scheme == "https" && uri.path?.startsWith("/_wispgate/assets/") == true) {
+                                val asset = state.assetForUrl(uri.toString())
+                                asset?.let {
+                                    runCatching {
+                                        WebResourceResponse(it.contentType, null, it.path.inputStream())
+                                    }.getOrNull()?.let { response -> return response }
+                                }
+                            }
+                            return WebResourceResponse(
+                                "text/plain", "UTF-8", 404, "Not Found", emptyMap(),
+                                ByteArrayInputStream("Unknown Wisp asset".toByteArray()),
+                            )
+                        }
+
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest): Boolean {
                             val uri = request.url
-                            if (uri.host == "wisp.local" || uri.scheme in setOf("about", "data", "blob", "javascript")) {
+                            if (state.isWispLocalUrl(uri.toString())) return true
+                            if (uri.scheme in setOf("about", "data", "blob", "javascript")) {
                                 return false
                             }
                             if (request.isForMainFrame && uri.scheme in setOf("http", "https")) {
@@ -420,5 +459,6 @@ private fun WebAppScreen(
                 view.destroy()
             },
         )
+        }
     }
 }
