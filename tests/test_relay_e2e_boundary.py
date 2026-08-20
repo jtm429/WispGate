@@ -211,6 +211,45 @@ def test_relay_accepts_session_envelope_larger_than_default_line_limit(tmp_path:
     asyncio.run(scenario())
 
 
+def test_relay_ingress_forwards_session_reset_to_online_peer(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        relay = runtime(tmp_path)
+        relay.state.clients["prime-wisp"] = {"session_token": "wisp-token"}
+        destination = RecordingWriter()
+        relay.sessions["android-user"] = ("android-token", destination)  # type: ignore[assignment]
+        server = await asyncio.start_server(relay.handle_relay, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        writer = None
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(json.dumps({"type": "session", "session_token": "wisp-token"}).encode() + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline()) == {
+                "ok": True, "type": "ready", "client_id": "prime-wisp",
+            }
+            reset = {
+                "type": "session_reset",
+                "sender": "prime-wisp",
+                "recipient": "android-user",
+                "reason": "unknown_session",
+            }
+            writer.write(json.dumps(reset).encode() + b"\n")
+            await writer.drain()
+
+            assert json.loads(await asyncio.wait_for(reader.readline(), timeout=1)) == {
+                "ok": True, "type": "accepted", "message_type": "session_reset",
+            }
+            assert destination.messages == [reset]
+        finally:
+            if writer is not None:
+                writer.close()
+                await writer.wait_closed()
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
 def test_relay_rejects_session_plaintext_spoofing_and_unknown_fields(tmp_path: Path) -> None:
     relay = runtime(tmp_path)
     sender = RecordingWriter()

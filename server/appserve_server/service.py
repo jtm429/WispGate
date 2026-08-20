@@ -161,7 +161,7 @@ class RelayRuntime:
             LOG.info("relay connected: %s from %s", client_id, peer)
             while line := await reader.readline():
                 message = json.loads(line)
-                if message.get("type") not in {"envelope", "session_envelope"}:
+                if message.get("type") not in {"envelope", "session_envelope", "session_reset"}:
                     await send_json(writer, {"ok": False, "error": "invalid_envelope"})
                     continue
                 await self.forward(client_id, message)
@@ -287,6 +287,14 @@ class RelayRuntime:
                 and isinstance(envelope.get("ciphertext"), str)
                 and 0 < len(envelope.get("ciphertext")) <= 1024 * 1024
             )
+        elif envelope.get("type") == "session_reset":
+            required = {"type", "sender", "recipient", "reason"}
+            allowed = required
+            valid_shape = (
+                envelope.get("sender") == sender
+                and isinstance(envelope.get("reason"), str)
+                and 1 <= len(envelope.get("reason")) <= 128
+            )
         else:
             required = {"version", "type", "sender", "recipient", "message_id", "algorithm", "encrypted_key", "nonce", "ciphertext", "signature"}
             allowed = required | {"sender_public_key"}
@@ -315,6 +323,8 @@ class RelayRuntime:
                         "ok": True, "type": "accepted", "session_id": envelope.get("session_id"),
                         "sequence": envelope.get("sequence"),
                     })
+                elif envelope.get("type") == "session_reset":
+                    await send_json(source[1], {"ok": True, "type": "accepted", "message_type": "session_reset"})
                 else:
                     await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
             try:
