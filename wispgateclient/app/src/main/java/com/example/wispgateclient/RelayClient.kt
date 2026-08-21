@@ -45,6 +45,9 @@ internal object RelayOperationCoordinator {
 }
 
 class RelayClient(private val context: Context) {
+    companion object {
+        const val MANAGEMENT_WISP_ID = "management"
+    }
     data class ServerInfo(
         val host: String,
         val publicKey: String,
@@ -155,6 +158,33 @@ class RelayClient(private val context: Context) {
         } catch (cause: Throwable) {
             socket.close()
             throw cause
+        }
+    }
+
+    suspend fun claimAdmin(info: ServerInfo): String = withContext(Dispatchers.IO) {
+        bootstrapTrust(info)
+        relaySocket(info.host, info.controlPort, tlsAnchor()).use { socket ->
+            socket.soTimeout = 15_000
+            val input = socket.reader()
+            val output = socket.writer()
+            authenticateEndpoint(input, output, AuthRole.CONTROL, clientId)
+            send(output, joinMessage(info, clientId))
+            val joined = input.readJson(output, "relay response")
+            if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
+            send(
+                output,
+                JSONObject()
+                    .put("type", "wisps")
+                    .put("client_public_key", E2EEnvelope.publicKeyText(identity.public))
+                    .put("items", JSONArray())
+                    .toString(),
+            )
+            val registration = input.readJson(output, "catalog registration")
+            if (!registration.optBoolean("ok")) error(registration.optString("error", "Catalog registration failed"))
+            send(output, JSONObject().put("type", "management_request").put("request", JSONObject().put("action", "claim_admin")).toString())
+            val result = input.readJson(output, "claim administrator response")
+            if (!result.optBoolean("ok")) error(result.optString("error", "Administrator claim rejected"))
+            result.optString("error", "claimed")
         }
     }
 

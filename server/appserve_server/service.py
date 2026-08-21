@@ -63,8 +63,8 @@ class RelayRuntime:
 
     def catalog_items(self, client_id: str | None = None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        if client_id and self._is_admin(client_id):
-            items.append({"id": "management", "name": "Management", "description": "Approve endpoints and manage server Wisps", "owner": "__server__", "public_key": self.config.public_key_text()})
+        if client_id and self.state.clients.get(client_id) and self._endpoint_usable(client_id, include_pending=True):
+            items.append({"id": "management", "name": "Management", "description": "Claim administrator access and manage server Wisps", "owner": "__server__", "public_key": self.config.public_key_text()})
         for manifest in self.state.wisps.values():
             owner = manifest.get("owner")
             if client_id and not self._endpoint_usable(client_id):
@@ -77,17 +77,30 @@ class RelayRuntime:
             items.append({**manifest, "public_key": public_key})
         return items
 
-    def _endpoint_usable(self, client_id: str) -> bool:
-        return self.state.clients.get(client_id, {}).get("status", "approved") == "approved"
+    def _endpoint_usable(self, client_id: str, *, include_pending: bool = False) -> bool:
+        status = self.state.clients.get(client_id, {}).get("status", "approved")
+        return status == "approved" or (include_pending and status == "pending")
 
     def _is_admin(self, client_id: str) -> bool:
         record = self.state.clients.get(client_id, {})
         return bool(record.get("admin")) and self._endpoint_usable(client_id)
 
     def management_request(self, client_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        action = request.get("action")
+        if action == "claim_admin":
+            result = self.state.claim_admin(client_id)
+            if result == "claimed":
+                return {"ok": True, "status": "approved", "admin": True}
+            if result == "already_admin":
+                return {"ok": True, "status": "approved", "admin": True, "error": "already_admin"}
+            if result == "admin_already_claimed":
+                return {"ok": False, "error": "admin_already_claimed"}
+            return {"ok": False, "error": result}
+        if action == "status":
+            record = self.state.clients.get(client_id)
+            return {"ok": True, "client_id": client_id, **record} if record else {"ok": False, "error": "unknown_endpoint"}
         if not self._is_admin(client_id):
             return {"ok": False, "error": "management_unauthorized"}
-        action = request.get("action")
         if action == "list_endpoints":
             return {"ok": True, "endpoints": [{"client_id": key, **value} for key, value in self.state.clients.items()]}
         if action in {"approve", "reject", "revoke"}:
@@ -146,7 +159,7 @@ class RelayRuntime:
                 access = self.state.client_access(client_id, encoded_key)
                 if access == "unknown_endpoint" and self.config.enrollment_enabled:
                     self.state.enroll_client(client_id, encoded_key, client_kind=client_kind)
-                elif access not in {"approved", "admin"}:
+                elif access not in {"approved", "admin", "pending"}:
                     await send_json(writer, {"ok": False, "error": "endpoint_" + access})
                     return
                 response = build_bootstrap_response(
@@ -154,7 +167,9 @@ class RelayRuntime:
                 )
                 await send_json(writer, {"ok": True, "type": "bootstrap_response", "payload": response.decode("ascii")})
                 auth = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
-            client_id = await self._authenticate_endpoint(reader, writer, auth, allowed_roles={"control"})
+            client_id = await self._authenticate_endpoint(
+                reader, writer, auth, allowed_roles={"control"}, allow_pending_control=True,
+            )
             if client_id is None:
                 return
             line = await asyncio.wait_for(reader.readline(), timeout=15)
@@ -200,8 +215,9 @@ class RelayRuntime:
                     self.state.save()
                     await send_json(writer, {"ok": True, "type": "wisps_registered", "items": self.catalog_items(client_id)})
                     await self.broadcast_catalog()
-                    if self._is_admin(client_id):
-                        self.control_sessions[client_id] = (client_id, writer)
+                    if self._is_admin(client_id) or self.state.clients.get(client_id, {}).get("status") == "pending":
+                        if self._is_admin(client_id):
+                            self.control_sessions[client_id] = (client_id, writer)
                         while line := await asyncio.wait_for(
                             reader.readline(), timeout=self.HEARTBEAT_TIMEOUT_SECONDS
                         ):
@@ -291,7 +307,7 @@ class RelayRuntime:
 
     async def _authenticate_endpoint(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, hello: dict[str, Any],
-        *, allowed_roles: set[str], allow_enrollment: bool = True,
+        *, allowed_roles: set[str], allow_enrollment: bool = True, allow_pending_control: bool = False,
     ) -> str | None:
         role = hello.get("role")
         client_id = hello.get("client_id")
@@ -339,7 +355,7 @@ class RelayRuntime:
             access = self.state.enroll_client(enrolled_id, enrolled_key, client_kind=enrolled_kind)
         else:
             access = self.state.client_access(enrolled_id, enrolled_key)
-        if access not in {"approved", "admin"}:
+        if access not in {"approved", "admin"} and not (access == "pending" and allow_pending_control and role == "control"):
             await send_json(writer, {"ok": False, "error": "endpoint_" + access if access in {"pending", "rejected", "revoked"} else access})
             return None
         self.state.register_client(enrolled_id, enrolled_key, replace=False)

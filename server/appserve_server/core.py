@@ -212,24 +212,37 @@ class RelayState:
         record["last_seen"] = int(time.time())
 
     def enroll_client(self, client_id: str, public_key: str, *, client_kind: str = "unknown") -> str:
-        """Atomically admit a key; only an explicitly identified Android endpoint may become first admin."""
+        """Atomically persist a newly bootstrapped endpoint as pending/unclaimed."""
         with self._enrollment_lock:
             record = self.clients.get(client_id)
             if record is not None:
                 if record.get("public_key") != public_key:
                     raise ValueError(f"client public key changed for {client_id}")
                 return "admin" if record.get("admin") else str(record.get("status", "pending"))
-            has_admin = any(item.get("admin") and item.get("status") == "approved" for item in self.clients.values())
-            eligible = client_kind == "android"
             self.clients[client_id] = {
                 "public_key": public_key,
                 "client_kind": client_kind,
-                "status": "approved" if eligible and not has_admin else "pending",
-                "admin": eligible and not has_admin,
+                "status": "pending",
+                "admin": False,
                 "last_seen": int(time.time()),
             }
             self.save()
-            return "admin" if eligible and not has_admin else "pending"
+            return "pending"
+
+    def claim_admin(self, client_id: str) -> str:
+        """Atomically perform the one-time administrator claim."""
+        with self._enrollment_lock:
+            record = self.clients.get(client_id)
+            if record is None:
+                return "unknown_endpoint"
+            if record.get("admin") and record.get("status") == "approved":
+                return "already_admin"
+            if any(item.get("admin") and item.get("status") == "approved" for item in self.clients.values()):
+                return "admin_already_claimed"
+            record["status"] = "approved"
+            record["admin"] = True
+            self.save()
+            return "claimed"
 
     def client_access(self, client_id: str, public_key: str) -> str:
         record = self.clients.get(client_id)

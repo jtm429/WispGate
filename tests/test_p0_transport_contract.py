@@ -177,7 +177,7 @@ def test_relay_auth_enrolls_once_rejects_changed_key_and_consumes_challenge(tmp_
         port = server.sockets[0].getsockname()[1]
         try:
             reader, writer, result = await authenticate(port, identity, "endpoint")
-            assert result == {"ok": True, "type": "authenticated", "client_id": "endpoint"}
+            assert result == {"ok": False, "error": "endpoint_pending"}
             writer.close()
             await writer.wait_closed()
             enrolled = json.loads(state.path.read_text(encoding="utf-8"))

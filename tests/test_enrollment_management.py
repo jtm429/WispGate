@@ -18,15 +18,15 @@ def sign_auth(identity, role: str, client_id: str, challenge: str) -> str:
     return base64.urlsafe_b64encode(identity.sign(transcript, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256())).decode("ascii").rstrip("=")
 
 
-def test_first_enrollment_is_admin_and_later_endpoints_are_pending(tmp_path: Path) -> None:
+def test_first_android_enrollment_is_pending_and_unclaimed(tmp_path: Path) -> None:
     state = RelayState(tmp_path / "state.json")
     first = public_key_text(generate_identity())
     second = public_key_text(generate_identity())
 
-    assert state.enroll_client("first", first, client_kind="android") == "admin"
+    assert state.enroll_client("first", first, client_kind="android") == "pending"
     assert state.enroll_client("second", second, client_kind="android") == "pending"
-    assert state.clients["first"]["status"] == "approved"
-    assert state.clients["first"]["admin"] is True
+    assert state.clients["first"]["status"] == "pending"
+    assert state.clients["first"]["admin"] is False
     assert state.clients["second"]["status"] == "pending"
 
 
@@ -35,7 +35,7 @@ def test_non_android_endpoint_cannot_claim_first_administrator(tmp_path: Path) -
     python_key = public_key_text(generate_identity())
     android_key = public_key_text(generate_identity())
     assert state.enroll_client("python", python_key, client_kind="python-wisp") == "pending"
-    assert state.enroll_client("android", android_key, client_kind="android") == "admin"
+    assert state.enroll_client("android", android_key, client_kind="android") == "pending"
 
 
 def test_enrollment_is_persistent_and_key_changes_fail_closed(tmp_path: Path) -> None:
@@ -47,7 +47,7 @@ def test_enrollment_is_persistent_and_key_changes_fail_closed(tmp_path: Path) ->
 
     restored = RelayState(path)
     restored.load()
-    assert restored.client_access("endpoint", key) == "approved"
+    assert restored.client_access("endpoint", key) == "pending"
     assert restored.client_access("endpoint", public_key_text(generate_identity())) == "endpoint_key_changed"
 
 
@@ -59,6 +59,8 @@ def test_management_operations_control_pending_endpoints_and_registered_wisps(tm
     state.enroll_client("admin", admin_key, client_kind="android")
     state.enroll_client("pending", pending_key, client_kind="android")
 
+    assert runtime.management_request("admin", {"action": "claim_admin"})["ok"] is True
+    assert runtime.management_request("admin", {"action": "claim_admin"})["error"] == "already_admin"
     assert runtime.management_request("admin", {"action": "list_endpoints"})["endpoints"][1]["status"] == "pending"
     assert runtime.management_request("admin", {"action": "approve", "client_id": "pending"})["ok"] is True
     assert state.client_access("pending", pending_key) == "approved"
@@ -111,11 +113,12 @@ def test_management_control_frame_path_is_socket_level(tmp_path: Path) -> None:
             writer.write((json.dumps({"type": "auth_proof", "signature": sign_auth(identity, "control", "android-device", challenge)}) + "\n").encode())
             await writer.drain()
             assert json.loads(await reader.readline())["ok"] is True
-            writer.write((json.dumps({"type": "management_request", "request": {"action": "list_endpoints"}}) + "\n").encode())
+            writer.write((json.dumps({"type": "management_request", "request": {"action": "claim_admin"}}) + "\n").encode())
             await writer.drain()
             response = json.loads(await reader.readline())
             assert response["type"] == "management_response"
             assert response["ok"] is True
+            assert response["status"] == "approved"
             writer.close()
             await writer.wait_closed()
         finally:
