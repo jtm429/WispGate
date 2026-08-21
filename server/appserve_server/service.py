@@ -180,11 +180,13 @@ class RelayRuntime:
             if request.get("type") != "join":
                 await send_json(writer, {"ok": False, "error": "invalid_bootstrap"})
                 return
-            payload = parse_bootstrap(self.config, request["payload"].encode("ascii"))
-            client_id = payload["client_id"]
-            client_key = payload["client_public_key"]
-            if client_key != self.state.clients[client_id].get("public_key"):
-                raise ValueError("endpoint key mismatch")
+            if request.get("payload"):
+                payload = parse_bootstrap(self.config, request["payload"].encode("ascii"))
+                if payload["client_id"] != client_id:
+                    raise ValueError("join client mismatch")
+                client_id = payload["client_id"]
+            elif request.get("client_id") != client_id:
+                raise ValueError("join client mismatch")
             self.state.save()
             await send_json(
                 writer,

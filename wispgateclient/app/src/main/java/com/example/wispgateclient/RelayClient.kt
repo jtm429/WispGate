@@ -419,23 +419,8 @@ class RelayClient(private val context: Context) {
         }
     }
 
-    private fun joinMessage(info: ServerInfo, clientId: String): String {
-        val nonce = ByteArray(20).also { java.security.SecureRandom().nextBytes(it) }
-        val payload = JSONObject()
-            .put("deployment_id", "private")
-            .put("client_id", clientId)
-            .put("client_kind", "android")
-            .put("client_public_key", E2EEnvelope.publicKeyText(identity.public))
-            .put("nonce", Base64.encodeToString(nonce, Base64.URL_SAFE or Base64.NO_WRAP))
-            .put("timestamp", System.currentTimeMillis() / 1000)
-            .toString()
-        val keyBytes = Base64.decode(info.publicKey, Base64.URL_SAFE or Base64.NO_WRAP)
-        val publicKey = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(keyBytes))
-        val cipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding")
-        cipher.init(Cipher.ENCRYPT_MODE, publicKey)
-        val encrypted = Base64.encodeToString(cipher.doFinal(payload.toByteArray()), Base64.URL_SAFE or Base64.NO_WRAP)
-        return JSONObject().put("type", "join").put("payload", encrypted).toString()
-    }
+    private fun joinMessage(info: ServerInfo, clientId: String): String =
+        JSONObject().put("type", "join").put("client_id", clientId).toString()
 
     private fun exchangeSessionFrame(
         input: BufferedReader,
