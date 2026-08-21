@@ -106,6 +106,12 @@ object E2EEnvelope {
     private fun decodePublicKey(value: String): PublicKey =
         KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(decode64(value)))
 
+    fun signPss(privateKey: PrivateKey, message: ByteArray): ByteArray =
+        signature(privateKey).run {
+            update(message)
+            sign()
+        }
+
     fun oaepParameters() =
         OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA1, PSource.PSpecified.DEFAULT)
 

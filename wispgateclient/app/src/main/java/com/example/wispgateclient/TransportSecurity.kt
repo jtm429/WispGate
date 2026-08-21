@@ -171,11 +171,7 @@ object EndpointAuthenticator {
             peer.orEmpty(),
             length?.toString().orEmpty(),
         ).joinToString("\n").toByteArray(Charsets.US_ASCII)
-        val signature = Signature.getInstance("RSASSA-PSS").apply {
-            setParameter(PSSParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 32, 1))
-            initSign(identity.private)
-            update(transcript)
-        }.sign()
+        val signature = E2EEnvelope.signPss(identity.private, transcript)
         writeFrame(
             JSONObject()
                 .put("type", "auth_proof")
