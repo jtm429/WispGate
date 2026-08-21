@@ -23,9 +23,6 @@ import androidx.compose.ui.unit.dp
 @Composable
 fun SettingsScreen(
     initial: RelayClient.ServerInfo,
-    onUpdate: () -> Unit,
-    updating: Boolean,
-    updateMessage: String?,
     onSave: (RelayClient.ServerInfo) -> Unit,
     onCancel: () -> Unit,
 ) {
@@ -58,10 +55,6 @@ fun SettingsScreen(
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(bulkPort, { bulkPort = it }, label = { Text("Bulk port") }, singleLine = true)
         Spacer(Modifier.height(12.dp))
-        Button(enabled = !updating, onClick = onUpdate) {
-            Text(if (updating) "Updating…" else "Update server from GitHub")
-        }
-        updateMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         Spacer(Modifier.height(20.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Button(onClick = onCancel) { Text("Cancel") }

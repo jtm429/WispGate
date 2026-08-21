@@ -92,10 +92,8 @@ private fun WispGateApp(client: RelayClient) {
     var loading by remember { mutableStateOf(false) }
     var connected by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
-    var updatingServer by remember { mutableStateOf(false) }
-    var updateMessage by remember { mutableStateOf<String?>(null) }
-    var claimingAdmin by remember { mutableStateOf(false) }
-    var claimMessage by remember { mutableStateOf<String?>(null) }
+
+
 
     fun replaceWispState(next: RelayClient.WispState?) {
         wispState = next
@@ -138,22 +136,6 @@ private fun WispGateApp(client: RelayClient) {
     if (settingsOpen) {
         SettingsScreen(
             initial = server!!,
-            onUpdate = {
-                scope.launch {
-                    updatingServer = true
-                    updateMessage = null
-                    try {
-                        client.updateServer(server!!)
-                        updateMessage = "Server update started."
-                    } catch (cause: Throwable) {
-                        updateMessage = cause.message ?: "Unable to start server update"
-                    } finally {
-                        updatingServer = false
-                    }
-                }
-            },
-            updating = updatingServer,
-            updateMessage = updateMessage,
             onSave = { info ->
                 client.saveServer(info)
                 server = info
@@ -276,7 +258,7 @@ private fun WispGateApp(client: RelayClient) {
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     items(wisps) { wisp ->
-                        Card(Modifier.fillMaxWidth().clickable(enabled = wisp.id != RelayClient.MANAGEMENT_WISP_ID) {
+                        Card(Modifier.fillMaxWidth().clickable {
                             selected = wisp
                             scope.launch {
                                 try {
@@ -293,28 +275,6 @@ private fun WispGateApp(client: RelayClient) {
                                 Text(wisp.description, style = MaterialTheme.typography.bodyMedium)
                                 if (wisp.id == RelayClient.MANAGEMENT_WISP_ID) {
                                     Text("Server-owned management · not a real Wisp")
-                                    Button(
-                                        enabled = !claimingAdmin,
-                                        onClick = {
-                                            scope.launch {
-                                                claimingAdmin = true
-                                                claimMessage = null
-                                                try {
-                                                    val result = client.claimAdmin(server!!)
-                                                    claimMessage = if (result == "already_admin") {
-                                                        "This endpoint is already the administrator."
-                                                    } else {
-                                                        "Administrator claimed."
-                                                    }
-                                                } catch (cause: Throwable) {
-                                                    claimMessage = cause.message ?: "Administrator claim rejected"
-                                                } finally {
-                                                    claimingAdmin = false
-                                                }
-                                            }
-                                        },
-                                    ) { Text(if (claimingAdmin) "Claiming…" else "Claim Administrator") }
-                                    claimMessage?.let { Text(it) }
                                 }
                             }
                         }

@@ -161,32 +161,6 @@ class RelayClient(private val context: Context) {
         }
     }
 
-    suspend fun claimAdmin(info: ServerInfo): String = withContext(Dispatchers.IO) {
-        bootstrapTrust(info)
-        relaySocket(info.host, info.controlPort, tlsAnchor()).use { socket ->
-            socket.soTimeout = 15_000
-            val input = socket.reader()
-            val output = socket.writer()
-            authenticateEndpoint(input, output, AuthRole.CONTROL, clientId)
-            send(output, joinMessage(info, clientId))
-            val joined = input.readJson(output, "relay response")
-            if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
-            send(
-                output,
-                JSONObject()
-                    .put("type", "wisps")
-                    .put("client_public_key", E2EEnvelope.publicKeyText(identity.public))
-                    .put("items", JSONArray())
-                    .toString(),
-            )
-            val registration = input.readJson(output, "catalog registration")
-            if (!registration.optBoolean("ok")) error(registration.optString("error", "Catalog registration failed"))
-            send(output, JSONObject().put("type", "management_request").put("request", JSONObject().put("action", "claim_admin")).toString())
-            val result = input.readJson(output, "claim administrator response")
-            if (!result.optBoolean("ok")) error(result.optString("error", "Administrator claim rejected"))
-            result.optString("error", "claimed")
-        }
-    }
 
     fun closeControlConnection() {
         controlJob?.cancel()
@@ -195,22 +169,6 @@ class RelayClient(private val context: Context) {
         controlSocket = null
     }
 
-    suspend fun updateServer(info: ServerInfo): String = withContext(Dispatchers.IO) {
-        bootstrapTrust(info)
-        relaySocket(info.host, info.controlPort, tlsAnchor()).use { socket ->
-            socket.soTimeout = 15_000
-            val input = socket.reader()
-            val output = socket.writer()
-            authenticateEndpoint(input, output, AuthRole.CONTROL, clientId)
-            send(output, joinMessage(info, clientId))
-            val joined = input.readJson(output, "relay response")
-            if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
-            send(output, JSONObject().put("type", "update_server").toString())
-            val result = input.readJson(output, "update response")
-            if (!result.optBoolean("ok")) error(result.optString("error", "Server update rejected"))
-            result.optString("type", "update_started")
-        }
-    }
 
     private fun parseWisps(items: JSONArray): List<Wisp> = buildList {
         for (index in 0 until items.length()) {
@@ -228,6 +186,7 @@ class RelayClient(private val context: Context) {
     }
 
     suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = RelayOperationCoordinator.serialized {
+        if (wisp.id == MANAGEMENT_WISP_ID) return@serialized requestManagementState(info)
         retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
             withContext(Dispatchers.IO) {
                 relaySocket(info.host, info.relayPort, tlsAnchor()).use { socket ->
@@ -248,6 +207,16 @@ class RelayClient(private val context: Context) {
     }
 
     suspend fun sendAction(info: ServerInfo, wisp: Wisp, action: String): WispState = RelayOperationCoordinator.serialized {
+        if (wisp.id == MANAGEMENT_WISP_ID) {
+            val request = runCatching { JSONObject(action) }.getOrElse {
+                return@serialized requestManagementState(info, "Invalid management action")
+            }
+            val result = managementRequest(info, request)
+            return@serialized requestManagementState(
+                info,
+                result.takeUnless { it.optBoolean("ok") }?.optString("error"),
+            )
+        }
         val operationId = UUID.randomUUID().toString()
         val body = OperationProtocol.userAction(wisp.id, JSONObject(action), operationId)
         recoverMutationOnce(
@@ -258,6 +227,27 @@ class RelayClient(private val context: Context) {
                 performActionAttempt(info, wisp, OperationProtocol.resume(wisp.id, it), it, recovering = true)
             },
         )
+    }
+
+    private suspend fun requestManagementState(info: ServerInfo, actionError: String? = null): WispState = withContext(Dispatchers.IO) {
+        val state = managementRequest(info, JSONObject().put("action", "state"))
+        if (!state.optBoolean("ok")) error(actionError ?: state.optString("error", "Management state unavailable"))
+        WispState(MANAGEMENT_WISP_ID, state.optString("html"))
+    }
+
+    private fun managementRequest(info: ServerInfo, request: JSONObject): JSONObject {
+        bootstrapTrust(info)
+        relaySocket(info.host, info.controlPort, tlsAnchor()).use { socket ->
+            socket.soTimeout = 15_000
+            val input = socket.reader()
+            val output = socket.writer()
+            authenticateEndpoint(input, output, AuthRole.CONTROL, clientId)
+            send(output, joinMessage(info, clientId))
+            val joined = input.readJson(output, "management join response")
+            if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
+            send(output, JSONObject().put("type", "management_request").put("request", request).toString())
+            return input.readJson(output, "management response")
+        }
     }
 
     private suspend fun performActionAttempt(

@@ -51,6 +51,52 @@ def test_enrollment_is_persistent_and_key_changes_fail_closed(tmp_path: Path) ->
     assert restored.client_access("endpoint", public_key_text(generate_identity())) == "endpoint_key_changed"
 
 
+def test_claimed_administrator_persists_as_authoritative_state(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    state = RelayState(path)
+    key = public_key_text(generate_identity())
+    state.enroll_client("endpoint", key, client_kind="android")
+    assert state.claim_admin("endpoint") == "claimed"
+
+    restored = RelayState(path)
+    restored.load()
+    assert restored.clients["endpoint"]["admin"] is True
+    assert restored.clients["endpoint"]["status"] == "approved"
+    assert restored.claim_admin("endpoint") == "already_admin"
+
+
+def test_management_state_is_server_owned_and_has_role_specific_controls(tmp_path: Path) -> None:
+    state = RelayState(tmp_path / "state.json")
+    runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=True), state)
+    pending_key = public_key_text(generate_identity())
+    other_key = public_key_text(generate_identity())
+    state.enroll_client("pending", pending_key, client_kind="android")
+    state.enroll_client("other", other_key, client_kind="android")
+
+    pending = runtime.management_request("pending", {"action": "state"})
+    assert pending["ok"] is True
+    assert "Claim Administrator" in pending["html"]
+    assert "Update server" not in pending["html"]
+
+    assert runtime.management_request("pending", {"action": "claim_admin"})["ok"] is True
+    admin = runtime.management_request("pending", {"action": "state"})
+    assert "Administrator" in admin["html"]
+    assert "Update server" in admin["html"]
+    assert "Claim Administrator" not in admin["html"]
+    assert "Approve" in admin["html"]
+    assert "Revoke" in admin["html"]
+
+
+def test_server_update_is_management_action_not_generic_control_action(tmp_path: Path) -> None:
+    state = RelayState(tmp_path / "state.json")
+    runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=True), state, update_command=("true",))
+    key = public_key_text(generate_identity())
+    state.enroll_client("endpoint", key, client_kind="android")
+    assert runtime.management_request("endpoint", {"action": "update_server"})["error"] == "management_unauthorized"
+    state.claim_admin("endpoint")
+    assert runtime.management_request("endpoint", {"action": "update_server"})["ok"] is True
+
+
 def test_management_operations_control_pending_endpoints_and_registered_wisps(tmp_path: Path) -> None:
     state = RelayState(tmp_path / "state.json")
     runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=True), state)

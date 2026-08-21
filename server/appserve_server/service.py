@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import json
 import logging
 import secrets
@@ -87,6 +88,21 @@ class RelayRuntime:
 
     def management_request(self, client_id: str, request: dict[str, Any]) -> dict[str, Any]:
         action = request.get("action")
+        if action in {"state", "status"}:
+            record = self.state.clients.get(client_id)
+            if record is None:
+                return {"ok": False, "error": "unknown_endpoint"}
+            if action == "status":
+                return {"ok": True, "client_id": client_id, **record}
+            admin = self._is_admin(client_id)
+            endpoints = [{"client_id": key, **value} for key, value in self.state.clients.items()] if admin else []
+            wisps = list(self.state.wisps.values()) if admin else []
+            return {
+                "ok": True,
+                "client_id": client_id,
+                **record,
+                "html": self._management_html(record, endpoints, wisps, admin=admin),
+            }
         if action == "claim_admin":
             result = self.state.claim_admin(client_id)
             if result == "claimed":
@@ -96,11 +112,13 @@ class RelayRuntime:
             if result == "admin_already_claimed":
                 return {"ok": False, "error": "admin_already_claimed"}
             return {"ok": False, "error": result}
-        if action == "status":
-            record = self.state.clients.get(client_id)
-            return {"ok": True, "client_id": client_id, **record} if record else {"ok": False, "error": "unknown_endpoint"}
         if not self._is_admin(client_id):
             return {"ok": False, "error": "management_unauthorized"}
+        if action == "update_server":
+            if not self.update_command:
+                return {"ok": False, "error": "update_unconfigured"}
+            subprocess.Popen(self.update_command, start_new_session=True)
+            return {"ok": True, "type": "update_started"}
         if action == "list_endpoints":
             return {"ok": True, "endpoints": [{"client_id": key, **value} for key, value in self.state.clients.items()]}
         if action in {"approve", "reject", "revoke"}:
@@ -122,6 +140,8 @@ class RelayRuntime:
             target = request.get("client_id")
             record = self.state.clients.get(target)
             return {"ok": True, "client_id": target, **record} if record else {"ok": False, "error": "unknown_endpoint"}
+        if action == "list_wisps":
+            return {"ok": True, "wisps": list(self.state.wisps.values())}
         if action == "register_wisp":
             wisp_id = request.get("id")
             if not isinstance(wisp_id, str) or not wisp_id or wisp_id == "management" or wisp_id in self.state.wisps:
@@ -137,6 +157,49 @@ class RelayRuntime:
             self.state.save()
             return {"ok": True, "id": wisp_id}
         return {"ok": False, "error": "unknown_management_action"}
+
+    @staticmethod
+    def _management_html(record: dict[str, Any], endpoints: list[dict[str, Any]], wisps: list[dict[str, Any]], *, admin: bool) -> str:
+        esc = html.escape
+
+        def button(action: dict[str, Any], label: str) -> str:
+            # Encode the JSON action as a JavaScript string; the native host remains generic.
+            value = esc(json.dumps(json.dumps(action, separators=(",", ":"))), quote=True)
+            return f'<button onclick="_WispGateNative.submit({value})">{esc(label)}</button>'
+
+        status = esc(str(record.get("status", "unknown")))
+        out = ["<main><h1>Management</h1>", f"<p>Status: <strong>{status}</strong>"]
+        if admin:
+            out.append(" · Administrator</p><h2>Server administration</h2>")
+            out.append(button({"action": "update_server"}, "Update server"))
+            out.append("<h2>Endpoints</h2><ul>")
+            for endpoint in sorted(endpoints, key=lambda item: item.get("client_id", "")):
+                client_id = str(endpoint.get("client_id", ""))
+                item = f"<li><code>{esc(client_id)}</code>: {esc(str(endpoint.get('status', 'unknown')))}"
+                if client_id != record.get("client_id"):
+                    endpoint_status = endpoint.get("status")
+                    if endpoint_status != "approved":
+                        item += button({"action": "approve", "client_id": client_id}, "Approve")
+                    if endpoint_status != "rejected":
+                        item += button({"action": "reject", "client_id": client_id}, "Reject")
+                    if endpoint_status != "revoked":
+                        item += button({"action": "revoke", "client_id": client_id}, "Revoke")
+                out.append(item + "</li>")
+            out.append("</ul><h2>Registered Wisps</h2><ul>")
+            for wisp in sorted(wisps, key=lambda item: item.get("id", "")):
+                wisp_id = str(wisp.get("id", ""))
+                out.append(
+                    f"<li><strong>{esc(str(wisp.get('name', wisp_id)))}</strong> "
+                    f"<code>{esc(wisp_id)}</code> {button({'action': 'remove_wisp', 'id': wisp_id}, 'Remove')}</li>"
+                )
+            out.append("</ul>")
+        else:
+            out.append("</p>")
+            if record.get("status") == "pending" and not record.get("admin"):
+                out.append(button({"action": "claim_admin"}, "Claim Administrator"))
+            else:
+                out.append("<p>Administrator access is not available for this endpoint.</p>")
+        return "".join(out) + "</main>"
 
     async def handle_control(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -231,8 +294,7 @@ class RelayRuntime:
                             elif control_message.get("type") == "management_request":
                                 response = self.management_request(client_id, control_message.get("request", {}))
                                 await send_json(writer, {"type": "management_response", **response})
-                elif message.get("type") == "update_server":
-                    await self.handle_update_request(writer, client_id)
+
             LOG.info("client joined: %s from %s", client_id, peer)
         except (KeyError, ValueError, json.JSONDecodeError, base64.binascii.Error, asyncio.TimeoutError) as exc:
             LOG.warning("rejected join from %s: %s", peer, exc)
@@ -254,15 +316,6 @@ class RelayRuntime:
         for client_id in stale:
             self.control_sessions.pop(client_id, None)
 
-    async def handle_update_request(self, writer: asyncio.StreamWriter, client_id: str) -> None:
-        if not self._is_admin(client_id):
-            await send_json(writer, {"ok": False, "error": "update_unauthorized"})
-            return
-        if not self.update_command:
-            await send_json(writer, {"ok": False, "error": "update_unconfigured"})
-            return
-        await send_json(writer, {"ok": True, "type": "update_started"})
-        subprocess.Popen(self.update_command, start_new_session=True)
 
     async def handle_relay(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
