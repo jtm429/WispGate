@@ -14,8 +14,11 @@ from .service import RelayRuntime, serve
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     result.add_argument("--private-key", type=Path, required=True)
+    result.add_argument("--tls-cert", type=Path, required=True)
+    result.add_argument("--tls-key", type=Path, required=True)
     result.add_argument("--state", type=Path, required=True)
     result.add_argument("--deployment-id", default="private")
+    result.add_argument("--allow-enrollment", action="store_true")
     result.add_argument("--control-host", default="0.0.0.0")
     result.add_argument("--control-port", type=int, default=443)
     result.add_argument("--relay-host", default="0.0.0.0")
@@ -35,7 +38,11 @@ def main() -> None:
     state.load()
     update_command = ("/usr/bin/sudo", "-n", str(args.update_script)) if args.update_script else None
     runtime = RelayRuntime(
-        RelayConfig(key, deployment_id=args.deployment_id),
+        RelayConfig(
+            key,
+            deployment_id=args.deployment_id,
+            enrollment_enabled=args.allow_enrollment,
+        ),
         state,
         update_command=update_command,
     )
@@ -47,6 +54,8 @@ def main() -> None:
         args.relay_port,
         args.bulk_host,
         args.bulk_port,
+        tls_cert_path=args.tls_cert,
+        tls_key_path=args.tls_key,
     ))
 
 

@@ -7,8 +7,8 @@ import java.io.File
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import java.net.InetSocketAddress
 import java.net.Socket
+import java.security.KeyPair
 import java.security.PrivateKey
 import java.util.Base64
 import java.util.UUID
@@ -105,26 +105,18 @@ object BulkSocketTransport {
         host: String,
         port: Int,
         recipient: String,
-        sessionToken: String,
+        tlsCertSha256: String,
+        clientId: String,
+        identity: KeyPair,
         upload: PreparedBulkUpload,
+        connect: (String, Int, String) -> Socket = { target, targetPort, pin -> RelayTls.connect(target, targetPort, pin) },
     ) {
-        Socket().use { socket ->
-            socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MILLIS)
+        connect(host, port, tlsCertSha256).use { socket ->
+            enableTcpKeepAlive(socket)
             socket.soTimeout = TRANSFER_TIMEOUT_MILLIS
-            val input = BufferedReader(InputStreamReader(socket.getInputStream()))
+            val input = socket.getInputStream()
             val output = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
-            output.write(
-                JSONObject()
-                    .put("type", "bulk")
-                    .put("session_token", sessionToken)
-                    .put("ticket", upload.ticket)
-                    .put("role", "sender")
-                    .put("peer", recipient)
-                    .put("length", upload.ciphertextSize)
-                    .toString(),
-            )
-            output.newLine()
-            output.flush()
+            authenticate(input, output, AuthRole.BULK_SENDER, clientId, identity, upload.ticket, recipient, upload.ciphertextSize)
 
             val ready = input.readJson("bulk relay readiness")
             if (!ready.optBoolean("ok") || ready.optString("type") != "bulk_ready") {
@@ -146,10 +138,13 @@ object BulkSocketTransport {
         port: Int,
         sender: String,
         recipient: String,
-        sessionToken: String,
+        tlsCertSha256: String,
+        clientId: String,
+        identity: KeyPair,
         offer: InboundAssetOffer,
         privateKey: PrivateKey,
         directory: File,
+        connect: (String, Int, String) -> Socket = { target, targetPort, pin -> RelayTls.connect(target, targetPort, pin) },
     ): ReceivedAsset {
         require(directory.exists() || directory.mkdirs()) { "Unable to create Wisp asset cache" }
         val destination = directory.resolve("${UUID.randomUUID()}.asset")
@@ -165,23 +160,12 @@ object BulkSocketTransport {
                 updateAAD(offer.aad(sender, recipient))
             }
 
-            Socket().use { socket ->
-                socket.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MILLIS)
+            connect(host, port, tlsCertSha256).use { socket ->
+                enableTcpKeepAlive(socket)
                 socket.soTimeout = TRANSFER_TIMEOUT_MILLIS
                 val input = socket.getInputStream()
                 val output = BufferedWriter(OutputStreamWriter(socket.getOutputStream()))
-                output.write(
-                    JSONObject()
-                        .put("type", "bulk")
-                        .put("session_token", sessionToken)
-                        .put("ticket", offer.ticket)
-                        .put("role", "receiver")
-                        .put("peer", sender)
-                        .put("length", offer.ciphertextSize)
-                        .toString(),
-                )
-                output.newLine()
-                output.flush()
+                authenticate(input, output, AuthRole.BULK_RECEIVER, clientId, identity, offer.ticket, sender, offer.ciphertextSize)
                 val ready = input.readJsonLine("bulk relay readiness")
                 if (!ready.optBoolean("ok") || ready.optString("type") != "bulk_ready") {
                     error(ready.optString("error", "Bulk relay rejected transfer"))
@@ -214,8 +198,24 @@ object BulkSocketTransport {
         }
     }
 
-    private fun BufferedReader.readJson(stage: String): JSONObject =
-        readLine()?.let(::JSONObject) ?: error("Relay closed connection while waiting for $stage")
+    private fun authenticate(
+        input: InputStream,
+        output: BufferedWriter,
+        role: AuthRole,
+        clientId: String,
+        identity: KeyPair,
+        ticket: String,
+        peer: String,
+        length: Long,
+    ) {
+        EndpointAuthenticator.authenticate(
+            role, clientId, identity, ticket, peer, length,
+            readFrame = { input.readJsonLine("endpoint authentication") },
+            writeFrame = { frame -> output.write(frame.toString()); output.newLine(); output.flush() },
+        )
+    }
+
+    private fun InputStream.readJson(stage: String): JSONObject = readJsonLine(stage)
 
     private fun InputStream.readJsonLine(stage: String): JSONObject {
         val bytes = java.io.ByteArrayOutputStream()

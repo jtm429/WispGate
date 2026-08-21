@@ -109,10 +109,18 @@ class SherpaDiarizer:
                 )
             )
         samples, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
+        expected_sample_rate = int(self._diarizer.sample_rate)
+        if int(sample_rate) != expected_sample_rate:
+            raise ValueError(
+                f"Diarization requires {expected_sample_rate} Hz audio, got {int(sample_rate)} Hz"
+            )
         if getattr(samples, "ndim", 1) > 1:
             samples = samples.mean(axis=1)
-        result = self._diarizer.process(samples.tolist(), int(sample_rate))
-        return [SpeakerSpan(float(item.start), float(item.end), f"speaker_{item.speaker}") for item in result]
+        result = self._diarizer.process(samples.tolist())
+        return [
+            SpeakerSpan(float(item.start), float(item.end), f"speaker_{item.speaker}")
+            for item in result.sort_by_start_time()
+        ]
 
 
 def merge_spans(transcript: list[TranscriptSpan], speakers: list[SpeakerSpan]) -> list[HumanTurn]:

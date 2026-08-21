@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import inspect
 import json
 import logging
 import re
 import secrets
 import shutil
+import ssl
 import tempfile
 import time
 from dataclasses import dataclass
@@ -34,14 +36,25 @@ LOG = logging.getLogger(__name__)
 _ASSET_ID_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 
 
+async def _invoke_wisp_callback(callback: Callable[..., Any], *args: Any) -> Any:
+    """Keep synchronous Wisp code from blocking relay and control I/O."""
+    result = await asyncio.to_thread(callback, *args)
+    return await result if inspect.isawaitable(result) else result
+
+
 @dataclass(frozen=True)
 class ServerInfo:
     host: str
     control_port: int
     relay_port: int
     server_public_key: bytes
+    tls_cert_sha256: str
     deployment_id: str = "private"
     bulk_port: int = 4444
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", self.tls_cert_sha256):
+            raise ValueError("tls_cert_sha256 must be a lowercase SHA-256 fingerprint")
 
 
 @dataclass
@@ -172,6 +185,8 @@ class AppserveClient:
     MAX_FILE_ACTION_BYTES = 256 * 1024 * 1024
     MAX_ACTIVE_TRANSFERS_PER_SENDER = 4
     FILE_TRANSFER_TIMEOUT_SECONDS = 10 * 60
+    HEARTBEAT_INTERVAL_SECONDS = 25.0
+    COMPLETED_OPERATION_TTL_SECONDS = 15 * 60
 
     def __init__(
         self,
@@ -186,7 +201,6 @@ class AppserveClient:
         self.client_id = client_id
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
-        self._session_token: str | None = None
         self._wisps: dict[str, Wisp] = {}
         self._identity_key = identity_key or generate_identity()
         self._peer_store_path = Path(peer_store_path) if peer_store_path else None
@@ -194,7 +208,11 @@ class AppserveClient:
         self._transfers: dict[tuple[str, str], _IncomingTransfer] = {}
         self._peer_keys: dict[str, str] = {}
         self._peer_sessions: dict[str, PeerSession] = {}
+        self._completed_operations: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+        self._active_operations: set[tuple[str, str]] = set()
+        self._operation_tasks: set[asyncio.Task[None]] = set()
         self._send_lock = asyncio.Lock()
+        self._relay_ready = asyncio.Event()
         if self._peer_store_path and self._peer_store_path.exists():
             stored = json.loads(self._peer_store_path.read_text(encoding="utf-8"))
             if isinstance(stored, dict):
@@ -222,15 +240,16 @@ class AppserveClient:
             await self.close()
 
     async def _serve_once(self) -> None:
-        reader, writer = await asyncio.open_connection(self.info.host, self.info.control_port)
+        reader, writer = await self._open_tls(self.info.control_port)
+        self._enable_tcp_keepalive(writer)
         self._reader, self._writer = reader, writer
         try:
+            await self._authenticate_endpoint(writer, reader, "control")
             bootstrap = self._bootstrap_payload()
             await self._send(writer, {"type": "join", "payload": bootstrap})
             joined = await self._read(reader)
             if not joined.get("ok"):
                 raise ConnectionError(joined.get("error", "join failed"))
-            self._session_token = joined["session_token"]
             await self._send(writer, self._registration_message())
             registration = await asyncio.wait_for(self._read(reader), timeout=10)
             if not registration.get("ok") or registration.get("type") != "wisps_registered":
@@ -242,18 +261,25 @@ class AppserveClient:
             await writer.wait_closed()
             self._reader = self._writer = None
 
-        reader, writer = await asyncio.open_connection(self.info.host, self.info.relay_port)
+        reader, writer = await self._open_tls(self.info.relay_port)
+        self._enable_tcp_keepalive(writer)
         self._reader, self._writer = reader, writer
-        await self._send(writer, {"type": "session", "session_token": self._session_token})
+        await self._authenticate_endpoint(writer, reader, "relay")
         ready = await self._read(reader)
         if not ready.get("ok"):
             raise ConnectionError(ready.get("error", "session failed"))
-        await self._event_loop()
+        self._relay_ready.set()
+        heartbeat = asyncio.create_task(self._heartbeat_loop())
+        try:
+            await self._event_loop()
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def close(self) -> None:
+        self._relay_ready.clear()
         writer = self._writer
         self._reader = self._writer = None
-        self._session_token = None
         self._peer_sessions.clear()
         if writer is not None:
             writer.close()
@@ -262,36 +288,40 @@ class AppserveClient:
             except (ConnectionError, OSError):
                 pass
         tasks = [transfer.task for transfer in self._transfers.values() if transfer.task is not None]
+        tasks.extend(self._operation_tasks)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._operation_tasks.clear()
+        self._active_operations.clear()
         for transfer in list(self._transfers.values()):
             self._cleanup_transfer(transfer)
         self._transfers.clear()
 
     def _close_connection(self) -> None:
+        self._relay_ready.clear()
         if self._writer is not None:
             self._writer.close()
         self._reader = self._writer = None
-        self._session_token = None
-        self._peer_sessions.clear()
-        for transfer in list(self._transfers.values()):
-            if transfer.task is not None:
-                transfer.task.cancel()
-            else:
-                self._cleanup_transfer(transfer)
-        self._transfers.clear()
 
     async def _event_loop(self) -> None:
         assert self._reader is not None
         while line := await self._reader.readline():
             message = json.loads(line)
-            if message.get("type") == "envelope":
+            if message.get("type") == "ping":
+                nonce = message.get("nonce")
+                if isinstance(nonce, str) and nonce:
+                    async with self._send_lock:
+                        if self._writer is not None:
+                            await self._send(self._writer, {"type": "pong", "nonce": nonce})
+            elif message.get("type") == "pong":
+                LOG.debug("relay heartbeat acknowledged")
+            elif message.get("type") == "envelope":
                 await self._handle_envelope(message)
             elif message.get("type") == "session_envelope":
                 try:
-                    await self._handle_session_envelope(message)
+                    await self._handle_session_envelope(message, background_mutations=True)
                 except ValueError as cause:
                     if str(cause) == "unknown session":
                         LOG.warning("rejected unknown peer session; requested a fresh session from sender")
@@ -314,6 +344,15 @@ class AppserveClient:
                 LOG.warning("relay rejected forwarded message: %s", message.get("error", "unknown error"))
             else:
                 LOG.warning("discarding unknown relay message type: %s", message.get("type"))
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.HEARTBEAT_INTERVAL_SECONDS)
+            await self._relay_ready.wait()
+            async with self._send_lock:
+                writer = self._writer
+                if writer is not None:
+                    await self._send(writer, {"type": "ping", "nonce": secrets.token_urlsafe(12)})
 
     def peer_public_key(self, client_id: str) -> str | None:
         return self._peer_keys.get(client_id)
@@ -363,7 +402,12 @@ class AppserveClient:
             "proof": session_accept_proof(master, session_id, challenge, sender, self.client_id),
         })
 
-    async def _handle_session_envelope(self, message: dict[str, Any]) -> None:
+    async def _handle_session_envelope(
+        self,
+        message: dict[str, Any],
+        *,
+        background_mutations: bool = False,
+    ) -> None:
         sender = message.get("sender")
         session = self._peer_sessions.get(sender)
         if session is None:
@@ -374,7 +418,9 @@ class AppserveClient:
         except Exception as cause:
             self._peer_sessions.pop(sender, None)
             raise ValueError(str(cause)) from cause
-        await self._dispatch_session_body(sender, body)
+        await self._dispatch_session_body(
+            sender, body, background_mutations=background_mutations
+        )
 
     async def _send_session_reset(self, recipient: str, reason: str) -> None:
         if not self._writer:
@@ -386,16 +432,53 @@ class AppserveClient:
             "reason": reason,
         })
 
-    async def _dispatch_session_body(self, sender: str, body: dict[str, Any]) -> None:
-        self._expire_file_transfers()
+    async def _dispatch_session_body(
+        self,
+        sender: str,
+        body: dict[str, Any],
+        *,
+        background_mutations: bool = False,
+    ) -> None:
+        await self._expire_file_transfers()
+        self._expire_completed_operations()
         wisp = self._wisps.get(body.get("wisp_id"))
         if not wisp:
             return
         action_kind = body.get("action")
+        if action_kind == "operation_resume":
+            operation_id = str(body.get("operation_id", ""))
+            key = (sender, operation_id)
+            completed = self._completed_operations.get(key)
+            if completed is not None:
+                response = dict(completed[1])
+                response.setdefault(
+                    "operation", {"type": "completed", "operation_id": operation_id}
+                )
+                await self._send_session(sender, response)
+            elif key in self._transfers or key in self._active_operations:
+                await self._send_session(sender, {
+                    "wisp_id": wisp.id,
+                    "operation": {"type": "running", "operation_id": operation_id},
+                })
+            else:
+                await self._send_session(sender, {
+                    "wisp_id": wisp.id,
+                    "operation": {"type": "expired", "operation_id": operation_id},
+                })
+            return
         if action_kind == "state_request":
-            state = wisp.state()
+            state = await _invoke_wisp_callback(wisp.state)
         elif action_kind == "file_begin":
             transfer_id = str(body.get("transfer_id", ""))
+            completed = self._completed_operations.get((sender, transfer_id))
+            if completed is not None:
+                await self._send_session(sender, completed[1])
+                return
+            if (sender, transfer_id) in self._transfers:
+                await self._send_session(
+                    sender, self._operation_status_body(wisp, "running", transfer_id)
+                )
+                return
             try:
                 response = self._begin_file_action(sender, wisp, body)
             except (KeyError, TypeError, ValueError) as cause:
@@ -413,12 +496,45 @@ class AppserveClient:
                 transfer.task = asyncio.create_task(self._receive_bulk_transfer(transfer_id, transfer))
             return
         else:
-            result = wisp.action(WispAction(body.get("action_data", {})))
-            state = await result if asyncio.iscoroutine(result) else result
+            operation_id = body.get("operation_id")
+            if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 128:
+                await self._send_session(sender, self._operation_status_body(
+                    wisp, "invalid", "", "mutating action requires a stable operation_id"
+                ))
+                return
+            key = (sender, operation_id)
+            completed = self._completed_operations.get(key)
+            if completed is not None:
+                await self._send_session(sender, completed[1])
+                return
+            if key in self._active_operations:
+                await self._send_session(sender, self._operation_status_body(wisp, "running", operation_id))
+                return
+            self._active_operations.add(key)
+            try:
+                state = await _invoke_wisp_callback(wisp.action, WispAction(body.get("action_data", {})))
+            except Exception:
+                retained = self._operation_status_body(wisp, "indeterminate", operation_id)
+                self._remember_completed_operation(sender, operation_id, retained)
+                raise
+            finally:
+                self._active_operations.discard(key)
+            retained = self._retained_response_body(wisp, state)
+            if retained is not None:
+                self._remember_completed_operation(sender, operation_id, retained)
         await self._send_wisp_response(sender, wisp, state)
 
     def _transfer_response(self, wisp: Wisp, transfer: dict[str, Any]) -> dict[str, Any]:
         return {"wisp_id": wisp.id, "transfer": transfer}
+
+    @staticmethod
+    def _operation_status_body(
+        wisp: Wisp, status: str, operation_id: str, error: str | None = None
+    ) -> dict[str, Any]:
+        operation: dict[str, Any] = {"type": status, "operation_id": operation_id}
+        if error is not None:
+            operation["error"] = error
+        return {"wisp_id": wisp.id, "operation": operation}
 
     def _begin_file_action(self, sender: str, wisp: Wisp, body: dict[str, Any]) -> dict[str, Any]:
         transfer_id = str(body.get("transfer_id", ""))
@@ -507,26 +623,54 @@ class AppserveClient:
                     field: items[0] if len(items) == 1 else tuple(items)
                     for field, items in grouped.items()
                 }
-                result = transfer.wisp.action(WispAction(transfer.action_data, exposed))
-                state = await result if asyncio.iscoroutine(result) else result
-                await self._send_wisp_response(transfer.sender, transfer.wisp, state)
-                return
+                state = await _invoke_wisp_callback(
+                    transfer.wisp.action,
+                    WispAction(transfer.action_data, exposed),
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as cause:
+                LOG.exception(
+                    "bulk transfer failed sender=%s transfer=%s",
+                    transfer.sender,
+                    transfer_id,
+                )
                 response = self._transfer_response(transfer.wisp, {
                     "type": "error",
                     "transfer_id": transfer_id,
                     "error": str(cause),
                 })
-            await self._send_session(transfer.sender, response)
+                self._remember_completed_operation(transfer.sender, transfer_id, response)
+                try:
+                    await self._send_session(transfer.sender, response)
+                except (ConnectionError, OSError, ValueError):
+                    LOG.warning(
+                        "retained failed bulk operation after delivery failure sender=%s transfer=%s",
+                        transfer.sender,
+                        transfer_id,
+                    )
+                return
+
+            retained = self._retained_response_body(transfer.wisp, state)
+            if retained is None:
+                retained = self._operation_status_body(
+                    transfer.wisp, "indeterminate", transfer_id
+                )
+            self._remember_completed_operation(transfer.sender, transfer_id, retained)
+            try:
+                await self._send_wisp_response(transfer.sender, transfer.wisp, state)
+            except (ConnectionError, OSError, ValueError):
+                LOG.warning(
+                    "retained successful bulk operation after delivery failure sender=%s transfer=%s",
+                    transfer.sender,
+                    transfer_id,
+                )
         finally:
             self._transfers.pop(key, None)
             self._cleanup_transfer(transfer)
 
     async def _receive_bulk_file(self, sender: str, transfer_id: str, incoming: _IncomingFile) -> None:
         assert incoming.bulk is not None
-        assert self._session_token is not None
         bulk = incoming.bulk
         encrypted_key = base64.urlsafe_b64decode(bulk["encrypted_key"] + "=" * (-len(bulk["encrypted_key"]) % 4))
         nonce = base64.urlsafe_b64decode(bulk["nonce"] + "=" * (-len(bulk["nonce"]) % 4))
@@ -538,16 +682,18 @@ class AppserveClient:
         )
         if len(file_key) != 32:
             raise ValueError("invalid bulk content key")
-        reader, writer = await asyncio.open_connection(self.info.host, self.info.bulk_port)
+        reader, writer = await self._open_tls(self.info.bulk_port)
         try:
             await self._send(writer, {
-                "type": "bulk",
-                "session_token": self._session_token,
+                "type": "auth_hello",
+                "role": "bulk_receiver",
+                "client_id": self.client_id,
+                "public_key": public_key_text(self._identity_key),
                 "ticket": bulk["ticket"],
-                "role": "receiver",
                 "peer": sender,
                 "length": bulk["ciphertext_size"],
             })
+            await self._complete_auth(reader, writer, "bulk_receiver", bulk["ticket"], sender, bulk["ciphertext_size"])
             ready = await self._read(reader)
             if not ready.get("ok") or ready.get("type") != "bulk_ready":
                 raise ConnectionError(ready.get("error", "bulk relay rejected transfer"))
@@ -587,11 +733,44 @@ class AppserveClient:
     def _cleanup_transfer(transfer: _IncomingTransfer) -> None:
         shutil.rmtree(transfer.directory, ignore_errors=True)
 
-    def _expire_file_transfers(self) -> None:
+    async def _expire_file_transfers(self) -> None:
         cutoff = time.monotonic() - self.FILE_TRANSFER_TIMEOUT_SECONDS
-        expired = [key for key, transfer in self._transfers.items() if transfer.created_at < cutoff]
-        for key in expired:
-            self._cleanup_transfer(self._transfers.pop(key))
+        expired = [(key, transfer) for key, transfer in self._transfers.items() if transfer.created_at < cutoff]
+        tasks: list[asyncio.Task[None]] = []
+        for (sender, operation_id), transfer in expired:
+            self._remember_completed_operation(
+                sender,
+                operation_id,
+                self._operation_status_body(transfer.wisp, "indeterminate", operation_id),
+            )
+            if transfer.task is not None and not transfer.task.done():
+                transfer.task.cancel()
+                tasks.append(transfer.task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for key, transfer in expired:
+            self._transfers.pop(key, None)
+            self._cleanup_transfer(transfer)
+
+    def _remember_completed_operation(self, sender: str, operation_id: str, body: dict[str, Any]) -> None:
+        if operation_id:
+            self._completed_operations[(sender, operation_id)] = (time.monotonic(), body)
+
+    def _expire_completed_operations(self) -> None:
+        cutoff = time.monotonic() - self.COMPLETED_OPERATION_TTL_SECONDS
+        self._completed_operations = {
+            key: value for key, value in self._completed_operations.items() if value[0] >= cutoff
+        }
+
+    @staticmethod
+    def _retained_response_body(wisp: Wisp, state: WispResponse | dict[str, Any]) -> dict[str, Any] | None:
+        if isinstance(state, WispResponse):
+            if state.assets:
+                return None
+            payload = state.payload()
+        else:
+            payload = state
+        return {"wisp_id": wisp.id, "response": payload}
 
     async def _send_wisp_response(
         self,
@@ -690,21 +869,21 @@ class AppserveClient:
         return prepared
 
     async def _send_outbound_asset(self, item: _PreparedOutboundAsset) -> None:
-        if not self._session_token:
-            raise ValueError("no relay session is available for bulk transfer")
-        reader, writer = await asyncio.open_connection(self.info.host, self.info.bulk_port)
+        reader, writer = await self._open_tls(self.info.bulk_port)
         try:
             await self._send(
                 writer,
                 {
-                    "type": "bulk",
-                    "session_token": self._session_token,
+                    "type": "auth_hello",
+                    "role": "bulk_sender",
+                    "client_id": self.client_id,
+                    "public_key": public_key_text(self._identity_key),
                     "ticket": item.ticket,
-                    "role": "sender",
                     "peer": item.recipient,
                     "length": item.ciphertext_size,
                 },
             )
+            await self._complete_auth(reader, writer, "bulk_sender", item.ticket, item.recipient, item.ciphertext_size)
             ready = await self._read(reader)
             if not ready.get("ok") or ready.get("type") != "bulk_ready":
                 raise ConnectionError(ready.get("error", "bulk relay rejected transfer"))
@@ -747,19 +926,24 @@ class AppserveClient:
             )
 
     async def _send_session(self, recipient: str, body: dict[str, Any]) -> None:
-        assert self._writer is not None
-        session = self._peer_sessions.get(recipient)
-        if session is None:
-            raise ValueError(f"no active session for {recipient}")
-        async with self._send_lock:
-            await self._send(self._writer, session.encrypt(body, now=time.monotonic()))
+        while True:
+            await self._relay_ready.wait()
+            async with self._send_lock:
+                writer = self._writer
+                if writer is None:
+                    continue
+                session = self._peer_sessions.get(recipient)
+                if session is None:
+                    raise ValueError(f"no active session for {recipient}")
+                await self._send(writer, session.encrypt(body, now=time.monotonic()))
+                return
 
     def _bootstrap_payload(self) -> str:
         key = serialization.load_der_public_key(self.info.server_public_key)
         payload = json.dumps({
             "deployment_id": self.info.deployment_id,
             "client_id": self.client_id,
-            "client_public_key": self.client_id,
+            "client_public_key": public_key_text(self._identity_key),
             "nonce": secrets.token_urlsafe(20),
             "timestamp": int(time.time()),
         }, separators=(",", ":")).encode()
@@ -769,10 +953,73 @@ class AppserveClient:
         )
         return base64.urlsafe_b64encode(encrypted).decode()
 
+    async def _authenticate_endpoint(
+        self, writer: asyncio.StreamWriter, reader: asyncio.StreamReader, role: str,
+    ) -> None:
+        await self._send(writer, {
+            "type": "auth_hello", "role": role, "client_id": self.client_id,
+            "public_key": public_key_text(self._identity_key),
+        })
+        await self._complete_auth(reader, writer, role)
+
+    async def _complete_auth(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, role: str = "",
+        ticket: str = "", peer: str = "", length: int | str = "",
+    ) -> None:
+        challenge = await self._read(reader)
+        if challenge.get("type") != "auth_challenge":
+            raise ConnectionError(challenge.get("error", "relay did not issue an endpoint challenge"))
+        transcript = f"wisp-relay-auth-v1\n{role}\n{self.client_id}\n{challenge['challenge']}\n{ticket}\n{peer}\n{length}".encode("ascii")
+        signature = self._identity_key.sign(
+            transcript,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32),
+            hashes.SHA256(),
+        )
+        await self._send(writer, {
+            "type": "auth_proof",
+            "signature": base64.urlsafe_b64encode(signature).decode().rstrip("="),
+        })
+        result = await self._read(reader)
+        if not result.get("ok"):
+            raise ConnectionError(result.get("error", "endpoint authentication rejected"))
+
     @staticmethod
     async def _send(writer: asyncio.StreamWriter, value: dict[str, Any]) -> None:
         writer.write(json.dumps(value, separators=(",", ":")).encode() + b"\n")
         await writer.drain()
+
+    @staticmethod
+    def _enable_tcp_keepalive(writer: asyncio.StreamWriter) -> None:
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            import socket
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    async def _open_tls(self, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.maximum_version = ssl.TLSVersion.TLSv1_3
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        reader, writer = await asyncio.open_connection(
+            self.info.host,
+            port,
+            ssl=context,
+            server_hostname=None,
+        )
+        ssl_object = writer.get_extra_info("ssl_object")
+        certificate = ssl_object.getpeercert(binary_form=True) if ssl_object else None
+        if certificate is None:
+            writer.close()
+            await writer.wait_closed()
+            raise ssl.SSLError("TLS peer did not present a certificate")
+        import hashlib
+        actual = hashlib.sha256(certificate).hexdigest()
+        if not secrets.compare_digest(actual, self.info.tls_cert_sha256):
+            writer.close()
+            await writer.wait_closed()
+            raise ssl.SSLError("TLS leaf certificate fingerprint mismatch")
+        return reader, writer
 
     @staticmethod
     async def _read(reader: asyncio.StreamReader) -> dict[str, Any]:
@@ -794,6 +1041,7 @@ def load(path: str | Path, *, reset_peer_trust: bool = False) -> AppserveClient:
             control_port=int(data.get("control_port", data.get("port", 443))),
             relay_port=int(data.get("relay_port", 4443)),
             server_public_key=base64.urlsafe_b64decode(key),
+            tls_cert_sha256=data["tls_cert_sha256"],
             deployment_id=data.get("deployment_id", "private"),
             bulk_port=int(data.get("bulk_port", 4444)),
         ),

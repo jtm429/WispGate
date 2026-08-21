@@ -53,6 +53,25 @@ If a recipient no longer has the referenced in-memory session, it sends an unenc
 
 The relay validates and forwards this control message without treating it as application data. The sender invalidates its cached peer session, performs a fresh RSA session handshake, and retries the interrupted request once from the beginning. A reset never weakens long-term peer-key trust or silently accepts a changed identity.
 
+## Transport heartbeat and transparent reanimation
+
+Logical peer sessions and Wisp operations are independent of one physical relay TCP connection. Every long-lived control or relay connection uses TCP keepalive plus protocol heartbeat frames:
+
+```json
+{"type":"ping","nonce":"bounded-random-value"}
+{"type":"pong","nonce":"bounded-random-value"}
+```
+
+These frames are relay-transport data, not end-to-end Wisp application data. The relay and endpoint runtimes consume them transparently, answer `ping` with the matching `pong`, and never expose them to a Wisp callback. Endpoints send heartbeats while a catalog subscription or operation owns the connection; the relay closes a connection that remains silent beyond the bounded heartbeat timeout. Application progress remains optional UX and is never required for liveness.
+
+After a physical connection dies, an endpoint reconnects and authenticates automatically. It reuses an unexpired in-memory peer session only when its directional sequence state is still continuous; otherwise it performs a fresh identity-authenticated handshake. Long-running file actions use their stable transfer ID as an operation ID. The Python runtime keeps the operation alive across relay reconnects and retains its final response for a bounded period. Android can send the encrypted body below rather than upload or execute the operation again:
+
+```json
+{"wisp_id":"transcription-diarization","action":"operation_resume","operation_id":"stable-transfer-id"}
+```
+
+The Wisp runtime returns the retained completion, a `running` status, or an explicit `expired` status. Reconnection and heartbeat behavior belongs to the shared runtimes and relay; individual Wisps do not implement it.
+
 ## Turn-based applet messages
 
 Applet traffic is organized as alternating actions and responses rather than a continuously synchronized UI state:
@@ -122,7 +141,7 @@ The relay persists client registration records and the information needed to att
 
 Reconnection never restores trust merely from an old relay session token. Long-term RSA identity trust is retained, but peer-session secrets are in-memory; after an endpoint reconnect they perform a new authenticated peer handshake.
 
-Peer sessions are in-memory and are re-established after relay or endpoint reconnection. Application-level operations that need retry safety remain responsible for idempotency. A relay restart must not cause a client to treat a relay acceptance acknowledgement as proof that the recipient processed a frame.
+Peer sessions are in-memory and are re-established after relay or endpoint reconnection. Shared file-action operations use stable transfer IDs and bounded completion retention so a reconnect resumes rather than repeats expensive work. Other mutating application actions still require a stable idempotency identity before they can be replayed automatically. A relay restart must not cause a client to treat a relay acceptance acknowledgement as proof that the recipient processed a frame.
 
 ## Message guarantees
 

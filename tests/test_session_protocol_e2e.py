@@ -34,10 +34,11 @@ class RecordingWriter:
 def test_authenticated_handshake_then_symmetric_actions_and_cleanup() -> None:
     android = generate_identity()
     wisp_key = generate_identity()
-    client = AppserveClient(ServerInfo("localhost", 1, 2, b"unused"), "prime-wisp", identity_key=wisp_key)
+    client = AppserveClient(ServerInfo("localhost", 1, 2, b"unused", "0" * 64), "prime-wisp", identity_key=wisp_key)
     client.register(Wisp("prime", "Prime", "", state=lambda: {"html": "state"}, action=lambda action: {"html": action["value"]}))
     writer = RecordingWriter()
     client._writer = writer  # type: ignore[assignment]
+    client._relay_ready.set()
     master = bytes(range(32))
     session_id = "session-1"
     challenge = "challenge-1"
@@ -77,7 +78,7 @@ def test_authenticated_handshake_then_symmetric_actions_and_cleanup() -> None:
 def test_rsa_application_message_is_not_a_compatibility_path() -> None:
     android = generate_identity()
     wisp_key = generate_identity()
-    client = AppserveClient(ServerInfo("localhost", 1, 2, b"unused"), "prime-wisp", identity_key=wisp_key)
+    client = AppserveClient(ServerInfo("localhost", 1, 2, b"unused", "0" * 64), "prime-wisp", identity_key=wisp_key)
     legacy = encrypt_envelope(
         sender="android-user", recipient="prime-wisp", message_id="old",
         body={"wisp_id": "prime", "action": "state_request"},
@@ -90,7 +91,7 @@ def test_rsa_application_message_is_not_a_compatibility_path() -> None:
 def test_invalid_session_frame_does_not_drop_wisp_identity_connection() -> None:
     android = generate_identity()
     wisp_key = generate_identity()
-    client = AppserveClient(ServerInfo("localhost", 1, 2, b"unused"), "prime-wisp", identity_key=wisp_key)
+    client = AppserveClient(ServerInfo("localhost", 1, 2, b"unused", "0" * 64), "prime-wisp", identity_key=wisp_key)
     writer = RecordingWriter()
     client._writer = writer  # type: ignore[assignment]
     invalid = {

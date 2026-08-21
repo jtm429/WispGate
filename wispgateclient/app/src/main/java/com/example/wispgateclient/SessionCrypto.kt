@@ -1,6 +1,7 @@
 package com.example.wispgateclient
 
 import org.json.JSONObject
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.security.KeyPair
 import java.security.MessageDigest
@@ -11,15 +12,40 @@ import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-class PeerSessionFailure(message: String, cause: Throwable? = null) : Exception(message, cause)
+class PeerSessionFailure(message: String, cause: Throwable? = null) : RecoverableSessionFailure(message, cause)
+
+internal fun requirePeerApplicationFrame(frame: JSONObject, expectedPeer: String): JSONObject {
+    if (frame.optString("type") != "session_reset") return frame
+    if (frame.optString("sender") != expectedPeer ||
+        frame.optString("recipient") != "android-user" ||
+        frame.optString("reason") != "unknown_session"
+    ) {
+        throw SecurityException("Invalid session reset")
+    }
+    throw PeerSessionFailure("Peer requested session reset: unknown_session")
+}
 
 suspend fun <T> retrySessionOnce(invalidate: () -> Unit, operation: suspend () -> T): T =
     try {
         operation()
-    } catch (_: PeerSessionFailure) {
+    } catch (cause: Exception) {
+        if (cause !is RecoverableSessionFailure && cause !is IOException) throw cause
         invalidate()
         operation()
     }
+
+suspend fun <T> recoverMutationOnce(
+    operationId: String,
+    invalidate: () -> Unit,
+    start: suspend (String) -> T,
+    resume: suspend (String) -> T,
+): T = try {
+    start(operationId)
+} catch (cause: Exception) {
+    if (cause !is RecoverableSessionFailure && cause !is IOException) throw cause
+    invalidate()
+    resume(operationId)
+}
 
 object SessionCrypto {
     const val LIFETIME_MILLIS = 30L * 60L * 1000L
@@ -127,7 +153,7 @@ object SessionHandshake {
 class PeerSession(
     val sessionId: String,
     private val localId: String,
-    private val peerId: String,
+    internal val peerId: String,
     keys: SessionCrypto.Keys,
     private val createdAtMillis: Long,
 ) {

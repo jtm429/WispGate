@@ -96,3 +96,37 @@ def test_sherpa_diarizer_uses_local_model_directory(tmp_path: Path) -> None:
     (tmp_path / "embedding.onnx").write_bytes(b"embedding")
     diarizer = SherpaDiarizer(tmp_path)
     assert diarizer.model_directory == tmp_path
+
+
+def test_sherpa_diarizer_passes_only_samples_to_installed_process_api(tmp_path: Path) -> None:
+    import soundfile as sf
+
+    (tmp_path / "segmentation.onnx").write_bytes(b"segmentation")
+    (tmp_path / "embedding.onnx").write_bytes(b"embedding")
+    audio_path = tmp_path / "episode.wav"
+    sf.write(audio_path, [0.0] * 160, 16_000)
+    observed: dict[str, object] = {}
+
+    class Segment:
+        start = 0.0
+        end = 0.01
+        speaker = 0
+
+    class FakeSherpaResult:
+        def sort_by_start_time(self):
+            return [Segment()]
+
+    class FakeSherpaEngine:
+        sample_rate = 16_000
+
+        def process(self, samples: list[float]):
+            observed["sample_count"] = len(samples)
+            return FakeSherpaResult()
+
+    diarizer = SherpaDiarizer(tmp_path)
+    diarizer._diarizer = FakeSherpaEngine()
+
+    result = diarizer.diarize(str(audio_path))
+
+    assert observed == {"sample_count": 160}
+    assert result == [SpeakerSpan(0.0, 0.01, "speaker_0")]

@@ -5,18 +5,27 @@ import base64
 import json
 import logging
 import secrets
+import ssl
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from .core import RelayConfig, RelayState, parse_bootstrap
 
 LOG = logging.getLogger("appserve.relay")
+
+
+def create_server_ssl_context(cert_path: str | Path, key_path: str | Path) -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_3
+    context.maximum_version = ssl.TLSVersion.TLSv1_3
+    context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    return context
 
 
 def valid_endpoint_public_key(value: str) -> bool:
@@ -38,12 +47,14 @@ class RelayRuntime:
     pending_bulk: dict[str, "_BulkConnection"] = field(default_factory=dict)
     consumed_bulk: dict[str, float] = field(default_factory=dict)
     bulk_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    auth_challenges: dict[str, tuple[str, str, str, float]] = field(default_factory=dict)
 
     MAX_BULK_BYTES = 256 * 1024 * 1024 + 16
     MAX_PENDING_BULK = 128
     BULK_TICKET_TTL_SECONDS = 10 * 60
     BULK_IO_TIMEOUT_SECONDS = 10 * 60
     RELAY_LINE_LIMIT_BYTES = 1024 * 1024 + 16 * 1024
+    HEARTBEAT_TIMEOUT_SECONDS = 75
 
     def catalog_items(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -57,7 +68,12 @@ class RelayRuntime:
 
     async def handle_control(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
+        client_id = None
         try:
+            auth = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
+            client_id = await self._authenticate_endpoint(reader, writer, auth, allowed_roles={"control"})
+            if client_id is None:
+                return
             line = await asyncio.wait_for(reader.readline(), timeout=15)
             request = json.loads(line)
             if request.get("type") != "join":
@@ -66,9 +82,8 @@ class RelayRuntime:
             payload = parse_bootstrap(self.config, request["payload"].encode("ascii"))
             client_id = payload["client_id"]
             client_key = payload["client_public_key"]
-            self.state.register_client(client_id, client_key, replace=False)
-            token = secrets.token_urlsafe(32)
-            self.state.clients[client_id]["session_token"] = token
+            if client_key != self.state.clients[client_id].get("public_key"):
+                raise ValueError("endpoint key mismatch")
             self.state.save()
             await send_json(
                 writer,
@@ -76,7 +91,7 @@ class RelayRuntime:
                     "ok": True,
                     "type": "joined",
                     "client_id": client_id,
-                    "session_token": token,
+
                     "queued": len(self.state.queues.get(client_id, [])),
                     "wisps": self.catalog_items(),
                 },
@@ -100,9 +115,15 @@ class RelayRuntime:
                     await send_json(writer, {"ok": True, "type": "wisps_registered", "items": self.catalog_items()})
                     await self.broadcast_catalog()
                     if client_id == "android-user":
-                        self.control_sessions[client_id] = (token, writer)
-                        while await reader.readline():
-                            pass
+                        self.control_sessions[client_id] = (client_id, writer)
+                        while line := await asyncio.wait_for(
+                            reader.readline(), timeout=self.HEARTBEAT_TIMEOUT_SECONDS
+                        ):
+                            control_message = json.loads(line)
+                            if control_message.get("type") == "ping":
+                                nonce = control_message.get("nonce")
+                                if isinstance(nonce, str) and 1 <= len(nonce) <= 128:
+                                    await send_json(writer, {"type": "pong", "nonce": nonce})
                 elif message.get("type") == "update_server":
                     await self.handle_update_request(writer, client_id)
             LOG.info("client joined: %s from %s", client_id, peer)
@@ -141,26 +162,29 @@ class RelayRuntime:
         client_id = None
         try:
             hello = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
-            if hello.get("type") != "session":
-                await send_json(writer, {"ok": False, "error": "unauthenticated"})
+            client_id = await self._authenticate_endpoint(reader, writer, hello, allowed_roles={"relay"})
+            if client_id is None:
                 return
-            token = hello.get("session_token")
-            client_id = next(
-                (cid for cid, record in self.state.clients.items() if record.get("session_token") == token),
-                None,
-            )
-            if not client_id:
-                await send_json(writer, {"ok": False, "error": "unauthenticated"})
-                return
-            self.sessions[client_id] = (token, writer)
+            self.sessions[client_id] = (client_id, writer)
             self.state.clients[client_id]["last_seen"] = int(asyncio.get_running_loop().time())
             await send_json(writer, {"ok": True, "type": "ready", "client_id": client_id})
             for queued in self.state.drain(client_id):
                 await send_json(writer, queued)
             self.state.save()
             LOG.info("relay connected: %s from %s", client_id, peer)
-            while line := await reader.readline():
+            while line := await asyncio.wait_for(
+                reader.readline(), timeout=self.HEARTBEAT_TIMEOUT_SECONDS
+            ):
                 message = json.loads(line)
+                if message.get("type") == "ping":
+                    nonce = message.get("nonce")
+                    if isinstance(nonce, str) and 1 <= len(nonce) <= 128:
+                        await send_json(writer, {"type": "pong", "nonce": nonce})
+                    else:
+                        await send_json(writer, {"ok": False, "error": "invalid_heartbeat"})
+                    continue
+                if message.get("type") == "pong":
+                    continue
                 if message.get("type") not in {"envelope", "session_envelope", "session_reset"}:
                     await send_json(writer, {"ok": False, "error": "invalid_envelope"})
                     continue
@@ -176,24 +200,72 @@ class RelayRuntime:
             writer.close()
             await writer.wait_closed()
 
+    async def _authenticate_endpoint(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, hello: dict[str, Any],
+        *, allowed_roles: set[str], allow_enrollment: bool = True,
+    ) -> str | None:
+        role = hello.get("role")
+        client_id = hello.get("client_id")
+        public_key = hello.get("public_key")
+        ticket = hello.get("ticket", "")
+        peer = hello.get("peer", "")
+        length = hello.get("length", "")
+        if role not in allowed_roles or not isinstance(client_id, str) or not client_id or len(client_id) > 128:
+            await send_json(writer, {"ok": False, "error": "invalid_auth_hello"})
+            return None
+        if not isinstance(public_key, str) or not valid_endpoint_public_key(public_key):
+            await send_json(writer, {"ok": False, "error": "invalid_auth_hello"})
+            return None
+        known = self.state.clients.get(client_id)
+        if known is None and (not self.config.enrollment_enabled or not allow_enrollment or role not in {"control", "relay"}):
+            await send_json(writer, {"ok": False, "error": "unknown_endpoint"})
+            return None
+        if known is not None and known.get("public_key") != public_key:
+            await send_json(writer, {"ok": False, "error": "endpoint_key_changed"})
+            return None
+        challenge = secrets.token_urlsafe(32)
+        key = secrets.token_urlsafe(24)
+        self.auth_challenges[key] = (client_id, public_key, challenge, time.monotonic() + 60)
+        await send_json(writer, {"type": "auth_challenge", "challenge": challenge})
+        proof = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
+        record = self.auth_challenges.pop(key, None)
+        signature = proof.get("signature")
+        if record is None or proof.get("type") != "auth_proof" or not isinstance(signature, str):
+            await send_json(writer, {"ok": False, "error": "invalid_auth_proof"})
+            return None
+        enrolled_id, enrolled_key, expected, expires = record
+        transcript = f"wisp-relay-auth-v1\n{role}\n{client_id}\n{expected}\n{ticket}\n{peer}\n{length}".encode("ascii")
+        try:
+            decoded_key = base64.urlsafe_b64decode(enrolled_key + "=" * (-len(enrolled_key) % 4))
+            public = serialization.load_der_public_key(decoded_key)
+            decoded_signature = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+            if expires < time.monotonic():
+                raise ValueError("expired challenge")
+            public.verify(decoded_signature, transcript, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256())
+        except Exception:
+            await send_json(writer, {"ok": False, "error": "invalid_auth_proof"})
+            return None
+        self.state.register_client(enrolled_id, enrolled_key, replace=False)
+        self.state.save()
+        await send_json(writer, {"ok": True, "type": "authenticated", "client_id": enrolled_id})
+        return enrolled_id
+
     async def handle_bulk(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         connection: _BulkConnection | None = None
         try:
             header = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
-            token = header.get("session_token")
-            client_id = next(
-                (cid for cid, record in self.state.clients.items() if record.get("session_token") == token),
-                None,
+            client_id = await self._authenticate_endpoint(
+                reader, writer, header,
+                allowed_roles={"bulk_sender", "bulk_receiver"}, allow_enrollment=False,
             )
-            if not client_id:
-                await send_json(writer, {"ok": False, "error": "unauthenticated"})
+            if client_id is None:
                 return
             ticket = header.get("ticket")
-            role = header.get("role")
+            role = {"bulk_sender": "sender", "bulk_receiver": "receiver"}.get(header.get("role"))
             peer = header.get("peer")
             length = header.get("length")
             if (
-                header.get("type") != "bulk"
+                header.get("type") != "auth_hello"
                 or not isinstance(ticket, str) or not 16 <= len(ticket) <= 256
                 or role not in {"sender", "receiver"}
                 or not isinstance(peer, str) or not peer or peer == client_id
@@ -371,15 +443,21 @@ async def serve(
     relay_port: int,
     bulk_host: str = "0.0.0.0",
     bulk_port: int = 4444,
+    tls_cert_path: str | Path | None = None,
+    tls_key_path: str | Path | None = None,
 ) -> None:
-    control = await asyncio.start_server(runtime.handle_control, control_host, control_port)
+    if tls_cert_path is None or tls_key_path is None:
+        raise ValueError("production relay listeners require TLS certificate and key")
+    tls_context = create_server_ssl_context(tls_cert_path, tls_key_path)
+    control = await asyncio.start_server(runtime.handle_control, control_host, control_port, ssl=tls_context)
     relay = await asyncio.start_server(
         runtime.handle_relay,
         relay_host,
         relay_port,
         limit=runtime.RELAY_LINE_LIMIT_BYTES,
+        ssl=tls_context,
     )
-    bulk = await asyncio.start_server(runtime.handle_bulk, bulk_host, bulk_port)
+    bulk = await asyncio.start_server(runtime.handle_bulk, bulk_host, bulk_port, ssl=tls_context)
     LOG.info("control listening on %s:%s", control_host, control_port)
     LOG.info("relay listening on %s:%s", relay_host, relay_port)
     LOG.info("bulk listening on %s:%s", bulk_host, bulk_port)

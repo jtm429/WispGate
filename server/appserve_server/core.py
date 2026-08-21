@@ -26,6 +26,7 @@ class RelayConfig:
     server_private_key: bytes
     deployment_id: str = "private"
     max_bootstrap_age: int = 300
+    enrollment_enabled: bool = False
 
     def private_key(self):
         return serialization.load_pem_private_key(self.server_private_key, password=None)
@@ -111,7 +112,10 @@ class RelayState:
 
     def register_client(self, client_id: str, public_key: str, *, replace: bool = True) -> None:
         record = self.clients.setdefault(client_id, {})
-        if replace or "public_key" not in record:
+        known = record.get("public_key")
+        if known is not None and known != public_key:
+            raise ValueError(f"client public key changed for {client_id}")
+        if replace or known is None:
             record["public_key"] = public_key
         record["last_seen"] = int(time.time())
 

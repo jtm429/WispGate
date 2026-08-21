@@ -8,6 +8,31 @@ import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
+internal object OperationProtocol {
+    enum class Status { RUNNING, COMPLETED }
+
+    fun userAction(wispId: String, actionData: JSONObject, operationId: String): JSONObject =
+        JSONObject()
+            .put("wisp_id", wispId)
+            .put("action", "user_action")
+            .put("operation_id", operationId)
+            .put("action_data", actionData)
+
+    fun resume(wispId: String, operationId: String): JSONObject =
+        JSONObject()
+            .put("wisp_id", wispId)
+            .put("action", "operation_resume")
+            .put("operation_id", operationId)
+
+    fun recoveryStatus(status: String?, operationId: String): Status = when (status) {
+        "running" -> Status.RUNNING
+        "completed" -> Status.COMPLETED
+        else -> throw IndeterminateOperationException(
+            "Operation $operationId is ${status ?: "unknown"}; retry explicitly",
+        )
+    }
+}
+
 internal object StagedFileCache {
     private const val DIRECTORY_NAME = "wispgate-file-actions"
     private val sweptThisProcess = AtomicBoolean(false)
@@ -176,6 +201,7 @@ object FileActionProtocol {
         return JSONObject()
             .put("wisp_id", wispId)
             .put("action", "file_begin")
+            .put("operation_id", action.transferId)
             .put("transfer_id", action.transferId)
             .put("action_data", action.actionData)
             .put("files", files)

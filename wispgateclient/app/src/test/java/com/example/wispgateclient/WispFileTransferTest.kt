@@ -7,6 +7,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.net.Socket
 import java.nio.file.Files
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -203,21 +204,30 @@ class WispFileTransferTest {
         )
         val begin = FileActionProtocol.begin("wisp-1", action, prepared)
         val offer = begin.getJSONArray("files").getJSONObject(0).getJSONObject("bulk")
+        val identity = java.security.KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val tlsPin = "a".repeat(64)
         val server = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())
-        val receivedHeader = java.util.concurrent.atomic.AtomicReference<JSONObject>()
+        val receivedHello = java.util.concurrent.atomic.AtomicReference<JSONObject>()
+        val receivedProof = java.util.concurrent.atomic.AtomicReference<JSONObject>()
         val receivedCiphertext = java.util.concurrent.atomic.AtomicReference<ByteArray>()
         val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
         val serverTask = executor.submit {
             server.accept().use { socket ->
                 val input = socket.getInputStream()
-                val headerBytes = java.io.ByteArrayOutputStream()
-                while (true) {
-                    val next = input.read()
-                    require(next >= 0) { "sender closed before bulk header" }
-                    if (next == '\n'.code) break
-                    headerBytes.write(next)
+                fun readFrame(): JSONObject {
+                    val bytes = java.io.ByteArrayOutputStream()
+                    while (true) {
+                        val next = input.read()
+                        require(next >= 0) { "sender closed before auth frame" }
+                        if (next == '\n'.code) return JSONObject(bytes.toString(Charsets.UTF_8.name()))
+                        bytes.write(next)
+                    }
                 }
-                receivedHeader.set(JSONObject(headerBytes.toString(Charsets.UTF_8.name())))
+                receivedHello.set(readFrame())
+                socket.getOutputStream().write("{\"type\":\"auth_challenge\",\"challenge\":\"challenge-1\"}\n".toByteArray())
+                socket.getOutputStream().flush()
+                receivedProof.set(readFrame())
+                socket.getOutputStream().write("{\"ok\":true}\n".toByteArray())
                 socket.getOutputStream().write("{\"ok\":true,\"type\":\"bulk_ready\"}\n".toByteArray())
                 socket.getOutputStream().flush()
                 receivedCiphertext.set(input.readNBytes(prepared.single().ciphertextSize.toInt()))
@@ -230,8 +240,11 @@ class WispFileTransferTest {
             host = java.net.InetAddress.getLoopbackAddress().hostAddress!!,
             port = server.localPort,
             recipient = "wisp-owner",
-            sessionToken = "session-token",
+            tlsCertSha256 = tlsPin,
+            clientId = "android-user",
+            identity = identity,
             upload = prepared.single(),
+            connect = { _, targetPort, _ -> Socket(java.net.InetAddress.getLoopbackAddress(), targetPort) },
         )
         serverTask.get(5, java.util.concurrent.TimeUnit.SECONDS)
         executor.shutdownNow()
@@ -252,19 +265,15 @@ class WispFileTransferTest {
         }
 
         assertEquals("file_begin", begin.getString("action"))
+        assertEquals("transfer-1", begin.getString("operation_id"))
         assertEquals("RSA-OAEP-256+A256GCM", offer.getString("algorithm"))
         assertTrue(offer.getString("ticket").length >= 16)
-        assertEquals(
-            JSONObject()
-                .put("type", "bulk")
-                .put("session_token", "session-token")
-                .put("ticket", prepared.single().ticket)
-                .put("role", "sender")
-                .put("peer", "wisp-owner")
-                .put("length", prepared.single().ciphertextSize)
-                .toString(),
-            receivedHeader.get().toString(),
-        )
+        assertEquals("auth_hello", receivedHello.get().getString("type"))
+        assertEquals("bulk_sender", receivedHello.get().getString("role"))
+        assertEquals("android-user", receivedHello.get().getString("client_id"))
+        assertFalse(receivedHello.get().toString().contains("session_token"))
+        assertEquals("auth_proof", receivedProof.get().getString("type"))
+        assertTrue(receivedProof.get().getString("signature").isNotBlank())
         assertEquals(21, encrypted.size)
         assertEquals("hello", String(decrypt.doFinal(encrypted)))
         assertFalse(begin.toString().contains("file_chunk"))
@@ -310,35 +319,46 @@ class WispFileTransferTest {
         }
         val ciphertext = encrypt.doFinal(plaintext)
         val server = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())
-        val receivedHeader = java.util.concurrent.atomic.AtomicReference<JSONObject>()
+        val receivedHello = java.util.concurrent.atomic.AtomicReference<JSONObject>()
+        val receivedProof = java.util.concurrent.atomic.AtomicReference<JSONObject>()
         val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
         val serverTask = executor.submit {
             server.accept().use { socket ->
                 val input = socket.getInputStream()
-                val headerBytes = java.io.ByteArrayOutputStream()
-                while (true) {
-                    val next = input.read()
-                    require(next >= 0)
-                    if (next == '\n'.code) break
-                    headerBytes.write(next)
+                fun readFrame(): JSONObject {
+                    val bytes = java.io.ByteArrayOutputStream()
+                    while (true) {
+                        val next = input.read()
+                        require(next >= 0)
+                        if (next == '\n'.code) return JSONObject(bytes.toString(Charsets.UTF_8.name()))
+                        bytes.write(next)
+                    }
                 }
-                receivedHeader.set(JSONObject(headerBytes.toString(Charsets.UTF_8.name())))
+                receivedHello.set(readFrame())
+                socket.getOutputStream().write("{\"type\":\"auth_challenge\",\"challenge\":\"challenge-2\"}\n".toByteArray())
+                socket.getOutputStream().flush()
+                receivedProof.set(readFrame())
+                socket.getOutputStream().write("{\"ok\":true}\n".toByteArray())
                 socket.getOutputStream().write("{\"ok\":true,\"type\":\"bulk_ready\"}\n".toByteArray())
                 socket.getOutputStream().write(ciphertext)
                 socket.getOutputStream().flush()
             }
         }
         val directory = Files.createTempDirectory("wisp-asset-receive-test").toFile()
+        val tlsPin = "b".repeat(64)
 
         val received = BulkSocketTransport.receive(
             host = java.net.InetAddress.getLoopbackAddress().hostAddress!!,
             port = server.localPort,
             sender = "wisp-owner",
             recipient = "android-user",
-            sessionToken = "android-session-token",
+            tlsCertSha256 = tlsPin,
+            clientId = "android-user",
+            identity = identity,
             offer = offer,
             privateKey = identity.private,
             directory = directory,
+            connect = { _, targetPort, _ -> Socket(java.net.InetAddress.getLoopbackAddress(), targetPort) },
         )
         serverTask.get(5, java.util.concurrent.TimeUnit.SECONDS)
         executor.shutdownNow()
@@ -347,17 +367,12 @@ class WispFileTransferTest {
         assertEquals("qr-code", received.id)
         assertEquals("image/png", received.contentType)
         assertTrue(received.path.readBytes().contentEquals(plaintext))
-        assertEquals(
-            JSONObject()
-                .put("type", "bulk")
-                .put("session_token", "android-session-token")
-                .put("ticket", ticket)
-                .put("role", "receiver")
-                .put("peer", "wisp-owner")
-                .put("length", plaintext.size + 16)
-                .toString(),
-            receivedHeader.get().toString(),
-        )
+        assertEquals("auth_hello", receivedHello.get().getString("type"))
+        assertEquals("bulk_receiver", receivedHello.get().getString("role"))
+        assertEquals("android-user", receivedHello.get().getString("client_id"))
+        assertFalse(receivedHello.get().toString().contains("session_token"))
+        assertEquals("auth_proof", receivedProof.get().getString("type"))
+        assertTrue(receivedProof.get().getString("signature").isNotBlank())
         directory.deleteRecursively()
     }
 

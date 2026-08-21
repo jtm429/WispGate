@@ -51,6 +51,7 @@ class RelayClient(private val context: Context) {
         val controlPort: Int = 443,
         val relayPort: Int = 4443,
         val bulkPort: Int = 4444,
+        val tlsCertSha256: String = "",
     )
     data class Wisp(val id: String, val name: String, val description: String, val owner: String, val publicKey: String)
     data class WispState(
@@ -77,7 +78,7 @@ class RelayClient(private val context: Context) {
         }
     }
 
-    data class ConnectionResult(val wisps: List<Wisp>, val sessionToken: String)
+    data class ConnectionResult(val wisps: List<Wisp>)
 
     private val preferences = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
     private val identity by lazy { EndpointIdentity().keyPair() }
@@ -91,17 +92,20 @@ class RelayClient(private val context: Context) {
         val host = preferences.getString("host", null) ?: return null
         val key = preferences.getString("public_key", null) ?: return null
         return ServerInfo(
-            host,
-            key,
-            preferences.getInt("control_port", 443),
-            preferences.getInt("relay_port", 4443),
-            preferences.getInt("bulk_port", 4444),
+            host = host,
+            publicKey = key,
+            controlPort = preferences.getInt("control_port", 443),
+            relayPort = preferences.getInt("relay_port", 4443),
+            bulkPort = preferences.getInt("bulk_port", 4444),
+            tlsCertSha256 = preferences.getString("tls_cert_sha256", "") ?: "",
         )
     }
 
     fun saveServer(info: ServerInfo) {
         preferences.edit().putString("host", info.host).putString("public_key", info.publicKey)
-            .putInt("control_port", info.controlPort).putInt("relay_port", info.relayPort)
+            .putString("tls_cert_sha256", info.tlsCertSha256)
+            .putInt("control_port", info.controlPort)
+            .putInt("relay_port", info.relayPort)
             .putInt("bulk_port", info.bulkPort)
             .apply()
     }
@@ -109,13 +113,14 @@ class RelayClient(private val context: Context) {
     suspend fun connectAndListWisps(info: ServerInfo): ConnectionResult = withContext(Dispatchers.IO) {
         val clientId = "android-user"
         closeControlConnection()
-        val socket = Socket(info.host, info.controlPort)
+        val socket = relaySocket(info.host, info.controlPort, info.tlsCertSha256)
         try {
             socket.soTimeout = 10_000
             val input = socket.reader()
             val output = socket.writer()
+            authenticateEndpoint(input, output, AuthRole.CONTROL, clientId)
             send(output, joinMessage(info, clientId))
-            val joined = input.readJson("relay response")
+            val joined = input.readJson(output, "relay response")
             if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
             send(
                 output,
@@ -125,17 +130,15 @@ class RelayClient(private val context: Context) {
                     .put("items", JSONArray())
                     .toString(),
             )
-            val registration = input.readJson("relay response")
+            val registration = input.readJson(output, "relay response")
             if (!registration.optBoolean("ok")) error(registration.optString("error", "Wisp catalog registration failed"))
             val wisps = parseWisps(registration.optJSONArray("items") ?: JSONArray())
-            val sessionToken = joined.getString("session_token")
-            preferences.edit().putString("session_token", sessionToken).apply()
-            socket.soTimeout = 0
+            socket.soTimeout = RELAY_READ_IDLE_MILLIS
             controlSocket = socket
             controlJob = controlScope.launch {
                 try {
                     while (true) {
-                        val update = input.readJson("catalog update")
+                        val update = input.readJson(output, "catalog update")
                         if (update.optString("type") == "catalog_update") {
                             _catalogUpdates.emit(parseWisps(update.optJSONArray("items") ?: JSONArray()))
                         }
@@ -144,7 +147,7 @@ class RelayClient(private val context: Context) {
                     // The next explicit reconnect reports the actionable error.
                 }
             }
-            ConnectionResult(wisps, sessionToken)
+            ConnectionResult(wisps)
         } catch (cause: Throwable) {
             socket.close()
             throw cause
@@ -159,15 +162,16 @@ class RelayClient(private val context: Context) {
     }
 
     suspend fun updateServer(info: ServerInfo): String = withContext(Dispatchers.IO) {
-        Socket(info.host, info.controlPort).use { socket ->
+        relaySocket(info.host, info.controlPort, info.tlsCertSha256).use { socket ->
             socket.soTimeout = 15_000
             val input = socket.reader()
             val output = socket.writer()
+            authenticateEndpoint(input, output, AuthRole.CONTROL, "android-user")
             send(output, joinMessage(info, "android-user"))
-            val joined = input.readJson("relay response")
+            val joined = input.readJson(output, "relay response")
             if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
             send(output, JSONObject().put("type", "update_server").toString())
-            val result = input.readJson("update response")
+            val result = input.readJson(output, "update response")
             if (!result.optBoolean("ok")) error(result.optString("error", "Server update rejected"))
             result.optString("type", "update_started")
         }
@@ -191,98 +195,156 @@ class RelayClient(private val context: Context) {
     suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = RelayOperationCoordinator.serialized {
         retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
             withContext(Dispatchers.IO) {
-                val token = preferences.getString("session_token", null) ?: error("Connect before requesting state")
-                Socket(info.host, info.relayPort).use { socket ->
+                relaySocket(info.host, info.relayPort, info.tlsCertSha256).use { socket ->
                     socket.soTimeout = 10_000
                     val input = socket.reader()
                     val output = socket.writer()
-                    openRelaySession(input, output, token)
+                    authenticateEndpoint(input, output, AuthRole.RELAY, "android-user")
                     val body = JSONObject().put("wisp_id", wisp.id).put("action", "state_request")
                     val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
                     val peerSession = sessionFor(wisp.owner, peerKey, input, output)
                     val responseBody = exchangeSessionFrame(
                         input, output, peerSession, body, "Request rejected", "Wisp state response",
                     )
-                    receiveWispState(info, wisp, token, input, peerSession, responseBody)
+                    receiveWispState(info, wisp, input, output, peerSession, responseBody)
                 }
             }
         }
     }
 
     suspend fun sendAction(info: ServerInfo, wisp: Wisp, action: String): WispState = RelayOperationCoordinator.serialized {
-        retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
-            withContext(Dispatchers.IO) {
-                val token = preferences.getString("session_token", null) ?: error("Connect before sending action")
-                Socket(info.host, info.relayPort).use { socket ->
-                    socket.soTimeout = 10_000
-                    val input = socket.reader()
-                    val output = socket.writer()
-                    openRelaySession(input, output, token)
-                    val body = JSONObject().put("wisp_id", wisp.id).put("action", "user_action")
-                        .put("action_data", JSONObject(action))
-                    val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
-                    val peerSession = sessionFor(wisp.owner, peerKey, input, output)
-                    val responseBody = exchangeSessionFrame(
-                        input, output, peerSession, body, "Action rejected", "Wisp action response",
-                    )
-                    receiveWispState(info, wisp, token, input, peerSession, responseBody)
+        val operationId = UUID.randomUUID().toString()
+        val body = OperationProtocol.userAction(wisp.id, JSONObject(action), operationId)
+        recoverMutationOnce(
+            operationId = operationId,
+            invalidate = { invalidatePeerSession(wisp.owner) },
+            start = { performActionAttempt(info, wisp, body, it, recovering = false) },
+            resume = {
+                performActionAttempt(info, wisp, OperationProtocol.resume(wisp.id, it), it, recovering = true)
+            },
+        )
+    }
+
+    private suspend fun performActionAttempt(
+        info: ServerInfo,
+        wisp: Wisp,
+        body: JSONObject,
+        operationId: String,
+        recovering: Boolean,
+    ): WispState = withContext(Dispatchers.IO) {
+        relaySocket(info.host, info.relayPort, info.tlsCertSha256).use { socket ->
+            socket.soTimeout = RELAY_READ_IDLE_MILLIS
+            val input = socket.reader()
+            val output = socket.writer()
+            authenticateEndpoint(input, output, AuthRole.RELAY, "android-user")
+            val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
+            val peerSession = sessionFor(wisp.owner, peerKey, input, output)
+            var responseBody = exchangeSessionFrame(
+                input, output, peerSession, body,
+                if (recovering) "Operation resume rejected" else "Action rejected",
+                if (recovering) "Wisp operation status" else "Wisp action response",
+            )
+            if (recovering) {
+                responseBody = when (OperationProtocol.recoveryStatus(
+                    responseBody.optJSONObject("operation")?.optString("type"),
+                    operationId,
+                )) {
+                    OperationProtocol.Status.COMPLETED -> responseBody
+                    OperationProtocol.Status.RUNNING ->
+                        readSessionResponse(input, output, peerSession, "Wisp operation completion")
                 }
             }
+            receiveWispState(info, wisp, input, output, peerSession, responseBody)
         }
     }
 
     suspend fun sendFileAction(info: ServerInfo, wisp: Wisp, action: StagedFileAction): WispState = RelayOperationCoordinator.serialized {
-        retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
+        var reconnecting = false
+        val attempt: suspend (String) -> WispState = { operationId ->
             withContext(Dispatchers.IO) {
-                Log.i("WispFileTransfer", "sending begin transfer=${action.transferId} files=${action.files.size}")
-                val token = preferences.getString("session_token", null) ?: error("Connect before sending an action")
-                Socket(info.host, info.relayPort).use { socket ->
-                    socket.soTimeout = 10 * 60_000
+                Log.i("WispFileTransfer", "sending operation=$operationId files=${action.files.size}")
+                relaySocket(info.host, info.relayPort, info.tlsCertSha256).use { socket ->
+                    socket.soTimeout = RELAY_READ_IDLE_MILLIS
                     val input = socket.reader()
                     val output = socket.writer()
-                    openRelaySession(input, output, token)
+                    authenticateEndpoint(input, output, AuthRole.RELAY, "android-user")
                     val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
                     val peerSession = sessionFor(wisp.owner, peerKey, input, output)
-                    val prepared = BulkFileCrypto.prepare(
-                        sender = "android-user",
-                        recipient = wisp.owner,
-                        transferId = action.transferId,
-                        files = action.files,
-                        recipientPublicKey = peerKey,
-                    )
-
-                    val begun = exchangeSessionFrame(
-                        input, output, peerSession, FileActionProtocol.begin(wisp.id, action, prepared),
-                        "File action rejected", "encrypted Wisp response",
-                    )
-                    val transferReady = begun.optJSONObject("transfer") ?: error("Wisp did not accept the file action")
-                    if (transferReady.optString("type") == "error") error(transferReady.optString("error", "File action rejected"))
-                    if (transferReady.optString("type") != "ready" || transferReady.optString("transfer_id") != action.transferId) {
-                        error("Unexpected file-transfer response")
+                    var completed: JSONObject? = null
+                    if (reconnecting) {
+                        val resumed = exchangeSessionFrame(
+                            input, output, peerSession,
+                            OperationProtocol.resume(wisp.id, operationId),
+                            "Operation resume rejected", "Wisp operation status",
+                        )
+                        completed = when (OperationProtocol.recoveryStatus(
+                            resumed.optJSONObject("operation")?.optString("type"), operationId,
+                        )) {
+                            OperationProtocol.Status.COMPLETED -> resumed
+                            OperationProtocol.Status.RUNNING ->
+                                readSessionResponse(input, output, peerSession, "encrypted Wisp completion")
+                        }
                     }
-                    Log.i("WispFileTransfer", "Wisp ready transfer=${action.transferId} bulkFiles=${prepared.size}")
-
-                    prepared.forEach { upload ->
-                        BulkSocketTransport.send(info.host, info.bulkPort, wisp.owner, token, upload)
-                        Log.i("WispFileTransfer", "bulk file sent id=${upload.file.id} bytes=${upload.file.size}")
+                    if (completed == null) {
+                        val prepared = BulkFileCrypto.prepare(
+                            sender = "android-user",
+                            recipient = wisp.owner,
+                            transferId = action.transferId,
+                            files = action.files,
+                            recipientPublicKey = peerKey,
+                        )
+                        val begun = exchangeSessionFrame(
+                            input, output, peerSession, FileActionProtocol.begin(wisp.id, action, prepared),
+                            "File action rejected", "encrypted Wisp response",
+                        )
+                        val transferReady = begun.optJSONObject("transfer") ?: error("Wisp did not accept the file action")
+                        if (transferReady.optString("type") == "error") error(transferReady.optString("error", "File action rejected"))
+                        if (transferReady.optString("type") != "ready" || transferReady.optString("transfer_id") != action.transferId) {
+                            error("Unexpected file-transfer response")
+                        }
+                        Log.i("WispFileTransfer", "Wisp ready transfer=${action.transferId} bulkFiles=${prepared.size}")
+                        prepared.forEach { upload ->
+                            BulkSocketTransport.send(
+                                host = info.host,
+                                port = info.bulkPort,
+                                recipient = wisp.owner,
+                                tlsCertSha256 = info.tlsCertSha256,
+                                clientId = "android-user",
+                                identity = identity,
+                                upload = upload,
+                            )
+                            Log.i("WispFileTransfer", "bulk file sent id=${upload.file.id} bytes=${upload.file.size}")
+                        }
+                        completed = readSessionResponse(input, output, peerSession, "encrypted Wisp completion")
                     }
-
-                    val completed = readSessionResponse(input, peerSession, "encrypted Wisp completion")
+                    checkNotNull(completed)
                     completed.optJSONObject("transfer")?.let { transfer ->
                         if (transfer.optString("type") == "error") error(transfer.optString("error", "File action failed"))
                     }
                     Log.i("WispFileTransfer", "bulk action accepted transfer=${action.transferId}")
-                    receiveWispState(info, wisp, token, input, peerSession, completed)
+                    receiveWispState(info, wisp, input, output, peerSession, completed)
                 }
             }
         }
+        recoverMutationOnce(
+            operationId = action.transferId,
+            invalidate = { invalidatePeerSession(wisp.owner) },
+            start = {
+                reconnecting = false
+                attempt(it)
+            },
+            resume = {
+                reconnecting = true
+                attempt(it)
+            },
+        )
     }
 
     private fun receiveWispState(
         info: ServerInfo,
         wisp: Wisp,
-        sessionToken: String,
         input: BufferedReader,
+        output: BufferedWriter,
         peerSession: PeerSession,
         body: JSONObject,
     ): WispState {
@@ -300,14 +362,16 @@ class RelayClient(private val context: Context) {
                     port = info.bulkPort,
                     sender = wisp.owner,
                     recipient = "android-user",
-                    sessionToken = sessionToken,
+                    tlsCertSha256 = info.tlsCertSha256,
+                    clientId = "android-user",
+                    identity = identity,
                     offer = offer,
                     privateKey = identity.private,
                     directory = directory,
                 )
                 asset.id to asset
             }
-            val completion = readSessionResponse(input, peerSession, "Wisp asset completion")
+            val completion = readSessionResponse(input, output, peerSession, "Wisp asset completion")
                 .getJSONObject("assets")
             require(
                 completion.getString("type") == "complete" &&
@@ -336,12 +400,6 @@ class RelayClient(private val context: Context) {
         return JSONObject().put("type", "join").put("payload", encrypted).toString()
     }
 
-    private fun openRelaySession(input: BufferedReader, output: BufferedWriter, token: String) {
-        send(output, JSONObject().put("type", "session").put("session_token", token).toString())
-        val ready = input.readJson("relay response")
-        if (!ready.optBoolean("ok")) error(ready.optString("error", "Relay session failed"))
-    }
-
     private fun exchangeSessionFrame(
         input: BufferedReader,
         output: BufferedWriter,
@@ -356,17 +414,23 @@ class RelayClient(private val context: Context) {
             throw PeerSessionFailure("Could not send peer-session frame", cause)
         }
         val accepted = try {
-            input.readJson("relay response")
+            input.readJson(output, "relay response")
         } catch (cause: Exception) {
             throw PeerSessionFailure("Relay closed while accepting peer-session frame", cause)
         }
         if (!accepted.optBoolean("ok")) error(accepted.optString("error", rejectionMessage))
-        return readSessionResponse(input, session, responseStage)
+        return readSessionResponse(input, output, session, responseStage)
     }
 
-    private fun readSessionResponse(input: BufferedReader, session: PeerSession, stage: String): JSONObject =
+    private fun readSessionResponse(
+        input: BufferedReader,
+        output: BufferedWriter,
+        session: PeerSession,
+        stage: String,
+    ): JSONObject =
         try {
-            session.decrypt(input.readJson(stage), SystemClock.elapsedRealtime())
+            val frame = requirePeerApplicationFrame(input.readJson(output, stage), session.peerId)
+            session.decrypt(frame, SystemClock.elapsedRealtime())
         } catch (cause: Exception) {
             throw PeerSessionFailure("Peer session failed while waiting for $stage", cause)
         }
@@ -389,9 +453,9 @@ class RelayClient(private val context: Context) {
         RelayOperationCoordinator.peerSessions.keys.removeAll { it.startsWith("$owner:") }
         val pending = SessionHandshake.begin(owner, peerPublicKey, identity, now)
         send(output, pending.envelope.toString())
-        val accepted = input.readJson("session handshake relay acceptance")
+        val accepted = input.readJson(output, "session handshake relay acceptance")
         if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Session handshake rejected"))
-        val acceptance = input.readJson("authenticated Wisp session acceptance")
+        val acceptance = input.readJson(output, "authenticated Wisp session acceptance")
         return SessionHandshake.finish(pending, acceptance, SystemClock.elapsedRealtime()).also {
             RelayOperationCoordinator.peerSessions[cacheKey] = it
         }
@@ -411,9 +475,29 @@ class RelayClient(private val context: Context) {
         output.flush()
     }
 
-    private fun BufferedReader.readJson(stage: String): JSONObject =
-        readLine()?.let(::JSONObject) ?: error("Relay closed connection while waiting for $stage")
+    private fun BufferedReader.readJson(output: BufferedWriter, stage: String): JSONObject =
+        RelayFrames(
+            readLine = { readLine() },
+            writeFrame = { send(output, it.toString()) },
+        ).readApplicationFrame(stage)
 
+    private fun authenticateEndpoint(
+        input: BufferedReader,
+        output: BufferedWriter,
+        role: AuthRole,
+        clientId: String,
+    ) {
+        EndpointAuthenticator.authenticate(
+            role = role,
+            clientId = clientId,
+            identity = identity,
+            readFrame = { input.readJson(output, "endpoint authentication") },
+            writeFrame = { send(output, it.toString()) },
+        )
+    }
+
+    private fun relaySocket(host: String, port: Int, tlsCertSha256: String): Socket =
+        RelayTls.connect(host, port, tlsCertSha256)
     private fun Socket.reader() = BufferedReader(InputStreamReader(getInputStream()))
     private fun Socket.writer() = BufferedWriter(OutputStreamWriter(getOutputStream()))
 }
