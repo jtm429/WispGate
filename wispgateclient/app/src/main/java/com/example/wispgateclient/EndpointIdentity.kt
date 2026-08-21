@@ -6,7 +6,7 @@ import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 
-class EndpointIdentity(private val alias: String = "wispgate-endpoint-v1") {
+class EndpointIdentity(private val alias: String = "wispgate-endpoint-v2") {
     fun keyPair(): KeyPair {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         val privateKey = store.getKey(alias, null)
@@ -20,7 +20,7 @@ class EndpointIdentity(private val alias: String = "wispgate-endpoint-v1") {
                 KeyProperties.PURPOSE_DECRYPT or KeyProperties.PURPOSE_SIGN,
             )
                 .setKeySize(3072)
-                .setDigests(KeyProperties.DIGEST_SHA256)
+                .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA1)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
                 .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PSS)
                 .build(),

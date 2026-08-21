@@ -85,7 +85,7 @@ data class BootstrapRequest(val clientId: String, val nonce: ByteArray)
 data class BootstrapResponse(val certificateDer: ByteArray, val certificateSha256: ByteArray)
 
 object RelayBootstrap {
-    private val oaep = OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA256, PSource.PSpecified.DEFAULT)
+    private val oaep = OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA1, PSource.PSpecified.DEFAULT)
     private fun b64(value: ByteArray) = Base64.getUrlEncoder().withoutPadding().encodeToString(value)
     private fun unb64(value: String) = Base64.getUrlDecoder().decode(value)
     private fun seal(publicKey: java.security.PublicKey, payload: ByteArray): String {

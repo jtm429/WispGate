@@ -29,13 +29,13 @@ def _unb64(value: str) -> bytes:
 
 def _oaep_encrypt(key, value: bytes) -> bytes:
     return key.encrypt(value, padding.OAEP(
-        mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None,
+        mgf=padding.MGF1(algorithm=hashes.SHA1()), algorithm=hashes.SHA256(), label=None,
     ))
 
 
 def _oaep_decrypt(key, value: bytes) -> bytes:
     return key.decrypt(value, padding.OAEP(
-        mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None,
+        mgf=padding.MGF1(algorithm=hashes.SHA1()), algorithm=hashes.SHA256(), label=None,
     ))
 
 

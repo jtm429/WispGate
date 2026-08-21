@@ -954,7 +954,7 @@ class AppserveClient:
         }, separators=(",", ":")).encode()
         encrypted = key.encrypt(
             payload,
-            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
+            padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA1()), algorithm=hashes.SHA256(), label=None),
         )
         return base64.urlsafe_b64encode(encrypted).decode()
 
