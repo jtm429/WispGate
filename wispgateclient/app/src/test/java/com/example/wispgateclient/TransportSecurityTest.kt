@@ -14,20 +14,21 @@ import java.util.Base64
 
 class TransportSecurityTest {
     @Test
-    fun tlsPinRequiresExactLowercaseSha256AndTls13Only() {
-        val leafDer = "test leaf certificate".toByteArray()
-        val pin = java.security.MessageDigest.getInstance("SHA-256")
-            .digest(leafDer)
-            .joinToString("") { "%02x".format(it) }
-
+    fun encryptedBootstrapUsesNonceBoundCertificateTrustAndTls13Only() {
+        val relay = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val endpoint = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val nonce = "client nonce".toByteArray()
+        val request = RelayBootstrap.createRequest(relay.public, "android-user", endpoint.public, nonce)
+        val decodedRequest = RelayBootstrap.decryptRequest(relay.private, request)
+        assertEquals("android-user", decodedRequest.clientId)
+        assertTrue(nonce.contentEquals(decodedRequest.nonce))
+        val response = RelayBootstrap.createResponse(endpoint.public, nonce, "certificate".toByteArray())
+        val decodedResponse = RelayBootstrap.decryptResponse(endpoint.private, response, nonce)
+        assertEquals("certificate", String(decodedResponse.certificateDer))
+        assertThrows(SecurityException::class.java) {
+            RelayBootstrap.decryptResponse(endpoint.private, response, "wrong".toByteArray())
+        }
         assertEquals(listOf("TLSv1.3"), RelayTls.enabledProtocols().toList())
-        RelayTls.verifyLeafFingerprint(leafDer, pin)
-        assertThrows(SecurityException::class.java) {
-            RelayTls.verifyLeafFingerprint(leafDer, pin.uppercase())
-        }
-        assertThrows(SecurityException::class.java) {
-            RelayTls.verifyLeafFingerprint("different".toByteArray(), pin)
-        }
     }
 
     @Test

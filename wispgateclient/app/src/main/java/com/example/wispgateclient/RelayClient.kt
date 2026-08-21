@@ -51,7 +51,7 @@ class RelayClient(private val context: Context) {
         val controlPort: Int = 443,
         val relayPort: Int = 4443,
         val bulkPort: Int = 4444,
-        val tlsCertSha256: String = "",
+
     )
     data class Wisp(val id: String, val name: String, val description: String, val owner: String, val publicKey: String)
     data class WispState(
@@ -82,6 +82,11 @@ class RelayClient(private val context: Context) {
 
     private val preferences = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
     private val identity by lazy { EndpointIdentity().keyPair() }
+    private val clientId by lazy {
+        preferences.getString("endpoint_id", null) ?: UUID.randomUUID().toString().also {
+            preferences.edit().putString("endpoint_id", it).apply()
+        }
+    }
     private val controlScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var controlSocket: Socket? = null
     private var controlJob: Job? = null
@@ -97,13 +102,12 @@ class RelayClient(private val context: Context) {
             controlPort = preferences.getInt("control_port", 443),
             relayPort = preferences.getInt("relay_port", 4443),
             bulkPort = preferences.getInt("bulk_port", 4444),
-            tlsCertSha256 = preferences.getString("tls_cert_sha256", "") ?: "",
+
         )
     }
 
     fun saveServer(info: ServerInfo) {
         preferences.edit().putString("host", info.host).putString("public_key", info.publicKey)
-            .putString("tls_cert_sha256", info.tlsCertSha256)
             .putInt("control_port", info.controlPort)
             .putInt("relay_port", info.relayPort)
             .putInt("bulk_port", info.bulkPort)
@@ -111,9 +115,9 @@ class RelayClient(private val context: Context) {
     }
 
     suspend fun connectAndListWisps(info: ServerInfo): ConnectionResult = withContext(Dispatchers.IO) {
-        val clientId = "android-user"
         closeControlConnection()
-        val socket = relaySocket(info.host, info.controlPort, info.tlsCertSha256)
+        bootstrapTrust(info)
+        val socket = relaySocket(info.host, info.controlPort, tlsAnchor())
         try {
             socket.soTimeout = 10_000
             val input = socket.reader()
@@ -162,12 +166,13 @@ class RelayClient(private val context: Context) {
     }
 
     suspend fun updateServer(info: ServerInfo): String = withContext(Dispatchers.IO) {
-        relaySocket(info.host, info.controlPort, info.tlsCertSha256).use { socket ->
+        bootstrapTrust(info)
+        relaySocket(info.host, info.controlPort, tlsAnchor()).use { socket ->
             socket.soTimeout = 15_000
             val input = socket.reader()
             val output = socket.writer()
-            authenticateEndpoint(input, output, AuthRole.CONTROL, "android-user")
-            send(output, joinMessage(info, "android-user"))
+            authenticateEndpoint(input, output, AuthRole.CONTROL, clientId)
+            send(output, joinMessage(info, clientId))
             val joined = input.readJson(output, "relay response")
             if (!joined.optBoolean("ok")) error(joined.optString("error", "Join failed"))
             send(output, JSONObject().put("type", "update_server").toString())
@@ -195,11 +200,11 @@ class RelayClient(private val context: Context) {
     suspend fun requestState(info: ServerInfo, wisp: Wisp): WispState = RelayOperationCoordinator.serialized {
         retrySessionOnce(invalidate = { invalidatePeerSession(wisp.owner) }) {
             withContext(Dispatchers.IO) {
-                relaySocket(info.host, info.relayPort, info.tlsCertSha256).use { socket ->
+                relaySocket(info.host, info.relayPort, tlsAnchor()).use { socket ->
                     socket.soTimeout = 10_000
                     val input = socket.reader()
                     val output = socket.writer()
-                    authenticateEndpoint(input, output, AuthRole.RELAY, "android-user")
+                    authenticateEndpoint(input, output, AuthRole.RELAY, clientId)
                     val body = JSONObject().put("wisp_id", wisp.id).put("action", "state_request")
                     val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
                     val peerSession = sessionFor(wisp.owner, peerKey, input, output)
@@ -232,11 +237,11 @@ class RelayClient(private val context: Context) {
         operationId: String,
         recovering: Boolean,
     ): WispState = withContext(Dispatchers.IO) {
-        relaySocket(info.host, info.relayPort, info.tlsCertSha256).use { socket ->
+        relaySocket(info.host, info.relayPort, tlsAnchor()).use { socket ->
             socket.soTimeout = RELAY_READ_IDLE_MILLIS
             val input = socket.reader()
             val output = socket.writer()
-            authenticateEndpoint(input, output, AuthRole.RELAY, "android-user")
+            authenticateEndpoint(input, output, AuthRole.RELAY, clientId)
             val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
             val peerSession = sessionFor(wisp.owner, peerKey, input, output)
             var responseBody = exchangeSessionFrame(
@@ -263,11 +268,11 @@ class RelayClient(private val context: Context) {
         val attempt: suspend (String) -> WispState = { operationId ->
             withContext(Dispatchers.IO) {
                 Log.i("WispFileTransfer", "sending operation=$operationId files=${action.files.size}")
-                relaySocket(info.host, info.relayPort, info.tlsCertSha256).use { socket ->
+                relaySocket(info.host, info.relayPort, tlsAnchor()).use { socket ->
                     socket.soTimeout = RELAY_READ_IDLE_MILLIS
                     val input = socket.reader()
                     val output = socket.writer()
-                    authenticateEndpoint(input, output, AuthRole.RELAY, "android-user")
+                    authenticateEndpoint(input, output, AuthRole.RELAY, clientId)
                     val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
                     val peerSession = sessionFor(wisp.owner, peerKey, input, output)
                     var completed: JSONObject? = null
@@ -287,7 +292,7 @@ class RelayClient(private val context: Context) {
                     }
                     if (completed == null) {
                         val prepared = BulkFileCrypto.prepare(
-                            sender = "android-user",
+                            sender = clientId,
                             recipient = wisp.owner,
                             transferId = action.transferId,
                             files = action.files,
@@ -308,8 +313,8 @@ class RelayClient(private val context: Context) {
                                 host = info.host,
                                 port = info.bulkPort,
                                 recipient = wisp.owner,
-                                tlsCertSha256 = info.tlsCertSha256,
-                                clientId = "android-user",
+                                tlsCertSha256 = tlsAnchor(),
+                                clientId = clientId,
                                 identity = identity,
                                 upload = upload,
                             )
@@ -361,9 +366,9 @@ class RelayClient(private val context: Context) {
                     host = info.host,
                     port = info.bulkPort,
                     sender = wisp.owner,
-                    recipient = "android-user",
-                    tlsCertSha256 = info.tlsCertSha256,
-                    clientId = "android-user",
+                    recipient = clientId,
+                    tlsCertSha256 = tlsAnchor(),
+                    clientId = clientId,
                     identity = identity,
                     offer = offer,
                     privateKey = identity.private,
@@ -495,6 +500,25 @@ class RelayClient(private val context: Context) {
             writeFrame = { send(output, it.toString()) },
         )
     }
+
+    private fun bootstrapTrust(info: ServerInfo) {
+        val cached = preferences.getString("tls_anchor_sha256", null)
+        if (cached?.matches(Regex("[0-9a-f]{64}")) == true) return
+        val relayKey = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.decode(info.publicKey, Base64.URL_SAFE or Base64.NO_WRAP)))
+        val nonce = ByteArray(24).also { java.security.SecureRandom().nextBytes(it) }
+        RelayTls.bootstrapConnect(info.host, info.controlPort).use { socket ->
+            val input = socket.reader(); val output = socket.writer()
+            send(output, RelayBootstrap.createRequest(relayKey, clientId, identity.public, nonce).toString())
+            val response = input.readJson(output, "encrypted bootstrap response")
+            val decoded = RelayBootstrap.decryptResponse(identity.private, response, nonce)
+            val hash = decoded.certificateSha256.joinToString("") { "%02x".format(it) }
+            preferences.edit().putString("tls_anchor_sha256", hash).apply()
+        }
+    }
+
+    private fun tlsAnchor(): String = preferences.getString("tls_anchor_sha256", null)
+        ?.takeIf { it.matches(Regex("[0-9a-f]{64}")) }
+        ?: error("Relay encrypted bootstrap trust has not completed")
 
     private fun relaySocket(host: String, port: Int, tlsCertSha256: String): Socket =
         RelayTls.connect(host, port, tlsCertSha256)

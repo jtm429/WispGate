@@ -31,12 +31,12 @@ fun SettingsScreen(
 ) {
     var host by remember(initial) { mutableStateOf(initial.host) }
     var key by remember(initial) { mutableStateOf(initial.publicKey) }
-    var tlsCertSha256 by remember(initial) { mutableStateOf(initial.tlsCertSha256) }
+
     var controlPort by remember(initial) { mutableStateOf(initial.controlPort.toString()) }
     var relayPort by remember(initial) { mutableStateOf(initial.relayPort.toString()) }
     var bulkPort by remember(initial) { mutableStateOf(initial.bulkPort.toString()) }
 
-    val valid = host.isNotBlank() && key.isNotBlank() && tlsCertSha256.matches(Regex("[0-9a-f]{64}")) &&
+    val valid = host.isNotBlank() && key.isNotBlank() &&
         controlPort.toIntOrNull() != null && relayPort.toIntOrNull() != null && bulkPort.toIntOrNull() != null
 
     Column(
@@ -50,7 +50,7 @@ fun SettingsScreen(
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(key, { key = it }, label = { Text("Relay public key") }, singleLine = true)
         Spacer(Modifier.height(12.dp))
-        OutlinedTextField(tlsCertSha256, { tlsCertSha256 = it }, label = { Text("TLS leaf SHA-256 pin") }, singleLine = true)
+
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(controlPort, { controlPort = it }, label = { Text("Control port") }, singleLine = true)
         Spacer(Modifier.height(12.dp))
@@ -70,7 +70,7 @@ fun SettingsScreen(
                 onClick = {
                     onSave(
                         RelayClient.ServerInfo(
-                            host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt(), bulkPort.toInt(), tlsCertSha256.trim(),
+                            host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt(), bulkPort.toInt(),
                         ),
                     )
                 },

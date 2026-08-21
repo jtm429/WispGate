@@ -12,10 +12,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
-from .core import RelayConfig, RelayState, parse_bootstrap
+from .core import (
+    RelayConfig, RelayState, parse_bootstrap, decrypt_bootstrap_request,
+    build_bootstrap_response,
+)
 
 LOG = logging.getLogger("appserve.relay")
 
@@ -47,7 +51,8 @@ class RelayRuntime:
     pending_bulk: dict[str, "_BulkConnection"] = field(default_factory=dict)
     consumed_bulk: dict[str, float] = field(default_factory=dict)
     bulk_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    auth_challenges: dict[str, tuple[str, str, str, float]] = field(default_factory=dict)
+    auth_challenges: dict[str, tuple[str, str, str, str, float]] = field(default_factory=dict)
+    certificate_der: bytes | None = None
 
     MAX_BULK_BYTES = 256 * 1024 * 1024 + 16
     MAX_PENDING_BULK = 128
@@ -56,26 +61,107 @@ class RelayRuntime:
     RELAY_LINE_LIMIT_BYTES = 1024 * 1024 + 16 * 1024
     HEARTBEAT_TIMEOUT_SECONDS = 75
 
-    def catalog_items(self) -> list[dict[str, Any]]:
+    def catalog_items(self, client_id: str | None = None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
+        if client_id and self._is_admin(client_id):
+            items.append({"id": "management", "name": "Management", "description": "Approve endpoints and manage server Wisps", "owner": "__server__", "public_key": self.config.public_key_text()})
         for manifest in self.state.wisps.values():
             owner = manifest.get("owner")
+            if client_id and not self._endpoint_usable(client_id):
+                continue
+            if owner and not self._endpoint_usable(owner):
+                continue
             public_key = self.state.clients.get(owner, {}).get("public_key")
             if not public_key or not valid_endpoint_public_key(public_key):
                 continue
             items.append({**manifest, "public_key": public_key})
         return items
 
+    def _endpoint_usable(self, client_id: str) -> bool:
+        return self.state.clients.get(client_id, {}).get("status", "approved") == "approved"
+
+    def _is_admin(self, client_id: str) -> bool:
+        record = self.state.clients.get(client_id, {})
+        return bool(record.get("admin")) and self._endpoint_usable(client_id)
+
+    def management_request(self, client_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        if not self._is_admin(client_id):
+            return {"ok": False, "error": "management_unauthorized"}
+        action = request.get("action")
+        if action == "list_endpoints":
+            return {"ok": True, "endpoints": [{"client_id": key, **value} for key, value in self.state.clients.items()]}
+        if action in {"approve", "reject", "revoke"}:
+            target = request.get("client_id")
+            if not isinstance(target, str) or target == client_id:
+                return {"ok": False, "error": "invalid_endpoint"}
+            try:
+                self.state.set_client_status(target, {"approve": "approved", "reject": "rejected", "revoke": "revoked"}[action])
+            except KeyError:
+                return {"ok": False, "error": "unknown_endpoint"}
+            if action != "approve":
+                self.state.remove_wisps_for_owner(target)
+                for table in (self.sessions, self.control_sessions):
+                    session = table.pop(target, None)
+                    if session:
+                        session[1].close()
+            return {"ok": True, "client_id": target, "status": self.state.clients[target]["status"]}
+        if action == "inspect_endpoint":
+            target = request.get("client_id")
+            record = self.state.clients.get(target)
+            return {"ok": True, "client_id": target, **record} if record else {"ok": False, "error": "unknown_endpoint"}
+        if action == "register_wisp":
+            wisp_id = request.get("id")
+            if not isinstance(wisp_id, str) or not wisp_id or wisp_id == "management" or wisp_id in self.state.wisps:
+                return {"ok": False, "error": "invalid_wisp"}
+            self.state.wisps[wisp_id] = {"id": wisp_id, "name": request.get("name", wisp_id), "description": request.get("description", ""), "owner": request.get("owner", client_id)}
+            self.state.save()
+            return {"ok": True, "wisp": self.state.wisps[wisp_id]}
+        if action == "remove_wisp":
+            wisp_id = request.get("id")
+            if wisp_id not in self.state.wisps:
+                return {"ok": False, "error": "unknown_wisp"}
+            self.state.wisps.pop(wisp_id)
+            self.state.save()
+            return {"ok": True, "id": wisp_id}
+        return {"ok": False, "error": "unknown_management_action"}
+
     async def handle_control(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         client_id = None
         try:
             auth = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
+            if auth.get("type") == "bootstrap_request":
+                if self.certificate_der is None:
+                    await send_json(writer, {"ok": False, "error": "bootstrap_unavailable"})
+                    return
+                request = decrypt_bootstrap_request(
+                    self.config.private_key(), auth["payload"].encode("ascii")
+                )
+                client_id = request["client_id"]
+                client_kind = request.get("client_kind", "unknown")
+                client_key = request["client_public_key"]
+                encoded_key = base64.urlsafe_b64encode(client_key.public_bytes(
+                    serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+                )).decode("ascii").rstrip("=")
+                access = self.state.client_access(client_id, encoded_key)
+                if access == "unknown_endpoint" and self.config.enrollment_enabled:
+                    self.state.enroll_client(client_id, encoded_key, client_kind=client_kind)
+                elif access not in {"approved", "admin"}:
+                    await send_json(writer, {"ok": False, "error": "endpoint_" + access})
+                    return
+                response = build_bootstrap_response(
+                    client_key, request["nonce"], self.certificate_der
+                )
+                await send_json(writer, {"ok": True, "type": "bootstrap_response", "payload": response.decode("ascii")})
+                auth = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
             client_id = await self._authenticate_endpoint(reader, writer, auth, allowed_roles={"control"})
             if client_id is None:
                 return
             line = await asyncio.wait_for(reader.readline(), timeout=15)
             request = json.loads(line)
+            if request.get("type") == "management_request":
+                await send_json(writer, {"type": "management_response", **self.management_request(client_id, request.get("request", {}))})
+                return
             if request.get("type") != "join":
                 await send_json(writer, {"ok": False, "error": "invalid_bootstrap"})
                 return
@@ -93,7 +179,7 @@ class RelayRuntime:
                     "client_id": client_id,
 
                     "queued": len(self.state.queues.get(client_id, [])),
-                    "wisps": self.catalog_items(),
+                    "wisps": self.catalog_items(client_id),
                 },
             )
             registration = await asyncio.wait_for(reader.readline(), timeout=2)
@@ -112,9 +198,9 @@ class RelayRuntime:
                                 "owner": client_id,
                             }
                     self.state.save()
-                    await send_json(writer, {"ok": True, "type": "wisps_registered", "items": self.catalog_items()})
+                    await send_json(writer, {"ok": True, "type": "wisps_registered", "items": self.catalog_items(client_id)})
                     await self.broadcast_catalog()
-                    if client_id == "android-user":
+                    if self._is_admin(client_id):
                         self.control_sessions[client_id] = (client_id, writer)
                         while line := await asyncio.wait_for(
                             reader.readline(), timeout=self.HEARTBEAT_TIMEOUT_SECONDS
@@ -124,6 +210,9 @@ class RelayRuntime:
                                 nonce = control_message.get("nonce")
                                 if isinstance(nonce, str) and 1 <= len(nonce) <= 128:
                                     await send_json(writer, {"type": "pong", "nonce": nonce})
+                            elif control_message.get("type") == "management_request":
+                                response = self.management_request(client_id, control_message.get("request", {}))
+                                await send_json(writer, {"type": "management_response", **response})
                 elif message.get("type") == "update_server":
                     await self.handle_update_request(writer, client_id)
             LOG.info("client joined: %s from %s", client_id, peer)
@@ -141,14 +230,14 @@ class RelayRuntime:
         stale: list[str] = []
         for client_id, (_, writer) in list(self.control_sessions.items()):
             try:
-                await send_json(writer, message)
+                await send_json(writer, {"ok": True, "type": "catalog_update", "items": self.catalog_items(client_id)})
             except (ConnectionError, OSError):
                 stale.append(client_id)
         for client_id in stale:
             self.control_sessions.pop(client_id, None)
 
     async def handle_update_request(self, writer: asyncio.StreamWriter, client_id: str) -> None:
-        if client_id != "android-user":
+        if not self._is_admin(client_id):
             await send_json(writer, {"ok": False, "error": "update_unauthorized"})
             return
         if not self.update_command:
@@ -207,6 +296,7 @@ class RelayRuntime:
         role = hello.get("role")
         client_id = hello.get("client_id")
         public_key = hello.get("public_key")
+        client_kind = hello.get("client_kind", "unknown")
         ticket = hello.get("ticket", "")
         peer = hello.get("peer", "")
         length = hello.get("length", "")
@@ -225,7 +315,7 @@ class RelayRuntime:
             return None
         challenge = secrets.token_urlsafe(32)
         key = secrets.token_urlsafe(24)
-        self.auth_challenges[key] = (client_id, public_key, challenge, time.monotonic() + 60)
+        self.auth_challenges[key] = (client_id, public_key, challenge, client_kind, time.monotonic() + 60)
         await send_json(writer, {"type": "auth_challenge", "challenge": challenge})
         proof = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
         record = self.auth_challenges.pop(key, None)
@@ -233,8 +323,8 @@ class RelayRuntime:
         if record is None or proof.get("type") != "auth_proof" or not isinstance(signature, str):
             await send_json(writer, {"ok": False, "error": "invalid_auth_proof"})
             return None
-        enrolled_id, enrolled_key, expected, expires = record
-        transcript = f"wisp-relay-auth-v1\n{role}\n{client_id}\n{expected}\n{ticket}\n{peer}\n{length}".encode("ascii")
+        enrolled_id, enrolled_key, enrolled_expected, enrolled_kind, expires = record
+        transcript = f"wisp-relay-auth-v1\n{role}\n{client_id}\n{enrolled_expected}\n{ticket}\n{peer}\n{length}".encode("ascii")
         try:
             decoded_key = base64.urlsafe_b64decode(enrolled_key + "=" * (-len(enrolled_key) % 4))
             public = serialization.load_der_public_key(decoded_key)
@@ -244,6 +334,13 @@ class RelayRuntime:
             public.verify(decoded_signature, transcript, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256())
         except Exception:
             await send_json(writer, {"ok": False, "error": "invalid_auth_proof"})
+            return None
+        if known is None:
+            access = self.state.enroll_client(enrolled_id, enrolled_key, client_kind=enrolled_kind)
+        else:
+            access = self.state.client_access(enrolled_id, enrolled_key)
+        if access not in {"approved", "admin"}:
+            await send_json(writer, {"ok": False, "error": "endpoint_" + access if access in {"pending", "rejected", "revoked"} else access})
             return None
         self.state.register_client(enrolled_id, enrolled_key, replace=False)
         self.state.save()
@@ -449,6 +546,7 @@ async def serve(
     if tls_cert_path is None or tls_key_path is None:
         raise ValueError("production relay listeners require TLS certificate and key")
     tls_context = create_server_ssl_context(tls_cert_path, tls_key_path)
+    runtime.certificate_der = x509.load_pem_x509_certificate(Path(tls_cert_path).read_bytes()).public_bytes(serialization.Encoding.DER)
     control = await asyncio.start_server(runtime.handle_control, control_host, control_port, ssl=tls_context)
     relay = await asyncio.start_server(
         runtime.handle_relay,

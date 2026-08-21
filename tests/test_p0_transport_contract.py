@@ -16,7 +16,14 @@ from cryptography.x509.oid import NameOID
 
 from appserve.client import AppserveClient, ServerInfo
 from appserve.e2e import generate_identity, public_key_text
-from server.appserve_server.core import RelayConfig, RelayState
+from server.appserve_server.core import (
+    RelayConfig,
+    RelayState,
+    build_bootstrap_request,
+    decrypt_bootstrap_request,
+    build_bootstrap_response,
+    decrypt_bootstrap_response,
+)
 from server.appserve_server.service import RelayRuntime, create_server_ssl_context
 
 
@@ -48,11 +55,30 @@ def make_certificate(tmp_path: Path) -> tuple[Path, Path, str]:
     return cert_path, key_path, fingerprint
 
 
-def test_server_info_requires_lowercase_sha256_certificate_fingerprint() -> None:
-    with pytest.raises(TypeError):
-        ServerInfo("localhost", 443, 4443, b"key")  # type: ignore[call-arg]
-    with pytest.raises(ValueError, match="tls_cert_sha256"):
-        ServerInfo("localhost", 443, 4443, b"key", "A" * 64)
+def test_server_info_uses_relay_identity_bootstrap_without_manual_certificate_fingerprint() -> None:
+    info = ServerInfo("localhost", 443, 4443, b"relay-public-key")
+    assert not hasattr(info, "tls_cert_sha256")
+
+
+def test_encrypted_bootstrap_binds_client_nonce_challenge_and_certificate_hash() -> None:
+    relay = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    endpoint = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    nonce = b"client-fresh-nonce"
+    request = build_bootstrap_request(relay.public_key(), "android-user", endpoint.public_key(), nonce)
+    decoded = decrypt_bootstrap_request(relay, request)
+    assert decoded["client_id"] == "android-user"
+    assert decoded["client_public_key"].public_numbers() == endpoint.public_key().public_numbers()
+    assert decoded["nonce"] == nonce
+
+    response = build_bootstrap_response(
+        endpoint.public_key(), nonce, b"certificate-der"
+    )
+    result = decrypt_bootstrap_response(endpoint, response, nonce)
+
+    assert result["certificate_der"] == b"certificate-der"
+    assert result["certificate_sha256"] == hashlib.sha256(b"certificate-der").digest()
+    with pytest.raises(ValueError, match="nonce"):
+        decrypt_bootstrap_response(endpoint, response, b"different-nonce")
 
 
 def test_real_tls13_listener_accepts_pinned_client_and_rejects_plaintext(tmp_path: Path) -> None:
@@ -76,8 +102,9 @@ def test_real_tls13_listener_accepts_pinned_client_and_rejects_plaintext(tmp_pat
         )
         port = server.sockets[0].getsockname()[1]
         try:
-            info = ServerInfo("127.0.0.1", port, port, b"unused", fingerprint, bulk_port=port)
+            info = ServerInfo("127.0.0.1", port, port, b"unused", bulk_port=port)
             client = AppserveClient(info, "tls-test", identity_key=generate_identity())
+            client._tls_anchor_sha256 = fingerprint
             reader, writer = await client._open_tls(port)
             assert writer.get_extra_info("ssl_object").version() == "TLSv1.3"
             writer.write(b"tls\n")
@@ -124,6 +151,7 @@ async def authenticate(
         "type": "auth_hello",
         "role": role,
         "client_id": client_id,
+        "client_kind": "android",
         "public_key": public_key_text(identity),
     }).encode() + b"\n")
     await writer.drain()

@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,14 +12,101 @@ from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii")
 
 
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
 def _unb64(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value.encode("ascii"))
+    return base64.urlsafe_b64decode(value.encode("ascii") + b"=" * (-len(value) % 4))
+
+
+def _oaep_encrypt(key, value: bytes) -> bytes:
+    return key.encrypt(value, padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None,
+    ))
+
+
+def _oaep_decrypt(key, value: bytes) -> bytes:
+    return key.decrypt(value, padding.OAEP(
+        mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None,
+    ))
+
+
+def _seal(public_key, payload: bytes) -> bytes:
+    content_key = os.urandom(32)
+    nonce = os.urandom(12)
+    envelope = {
+        "key": _b64(_oaep_encrypt(public_key, content_key)),
+        "nonce": _b64(nonce),
+        "ciphertext": _b64(AESGCM(content_key).encrypt(nonce, payload, None)),
+    }
+    return json.dumps(envelope, separators=(",", ":")).encode("ascii")
+
+
+def _open(private_key, message: bytes) -> bytes:
+    envelope = json.loads(message)
+    return AESGCM(_oaep_decrypt(private_key, _unb64(envelope["key"]))).decrypt(
+        _unb64(envelope["nonce"]), _unb64(envelope["ciphertext"]), None
+    )
+
+
+def build_bootstrap_request(relay_public_key, client_id: str, client_public_key, nonce: bytes, client_kind: str = "unknown") -> bytes:
+    payload = json.dumps({
+        "version": 1,
+        "client_id": client_id,
+        "client_kind": client_kind,
+        "client_public_key": _b64u(client_public_key.public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+        )),
+        "nonce": _b64(nonce),
+    }, separators=(",", ":")).encode("utf-8")
+    return _b64u(_seal(relay_public_key, payload)).encode("ascii")
+
+
+def decrypt_bootstrap_request(relay_private_key, message: bytes) -> dict[str, Any]:
+    payload = json.loads(_open(relay_private_key, _unb64(message.decode("ascii"))))
+    if payload.get("version") != 1 or not isinstance(payload.get("client_id"), str) or not isinstance(payload.get("client_kind", "unknown"), str):
+        raise ValueError("invalid bootstrap request")
+    client_key = serialization.load_der_public_key(_unb64(payload["client_public_key"]))
+    nonce = _unb64(payload["nonce"])
+    if not isinstance(client_key, rsa.RSAPublicKey) or len(nonce) < 16:
+        raise ValueError("invalid bootstrap request")
+    return {"client_id": payload["client_id"], "client_kind": payload.get("client_kind", "unknown"), "client_public_key": client_key, "nonce": nonce}
+
+
+def build_bootstrap_response(client_public_key, nonce: bytes, certificate_der: bytes) -> bytes:
+    payload = json.dumps({
+        "version": 1,
+        "nonce": _b64u(nonce),
+
+        "certificate_der": _b64u(certificate_der),
+        "certificate_sha256": _b64u(__import__("hashlib").sha256(certificate_der).digest()),
+    }, separators=(",", ":")).encode("utf-8")
+    return _b64u(_seal(client_public_key, payload)).encode("ascii")
+
+
+def decrypt_bootstrap_response(client_private_key, message: bytes, expected_nonce: bytes) -> dict[str, bytes]:
+    payload = json.loads(_open(client_private_key, _unb64(message.decode("ascii"))))
+    nonce = _unb64(payload["nonce"])
+    if nonce != expected_nonce:
+        raise ValueError("bootstrap nonce mismatch")
+    certificate_der = _unb64(payload["certificate_der"])
+    certificate_sha256 = _unb64(payload["certificate_sha256"])
+    if certificate_sha256 != __import__("hashlib").sha256(certificate_der).digest():
+        raise ValueError("bootstrap certificate hash mismatch")
+    return {
+        "nonce": nonce,
+
+        "certificate_der": certificate_der,
+        "certificate_sha256": certificate_sha256,
+    }
 
 
 @dataclass
@@ -95,6 +183,7 @@ class RelayState:
         self.clients: dict[str, dict[str, Any]] = {}
         self.queues: dict[str, list[dict[str, Any]]] = {}
         self.wisps: dict[str, dict[str, Any]] = {}
+        self._enrollment_lock = threading.RLock()
 
     def load(self) -> None:
         if not self.path.exists():
@@ -103,6 +192,9 @@ class RelayState:
         self.clients = data.get("clients", {})
         self.queues = data.get("queues", {})
         self.wisps = data.get("wisps", {})
+        for record in self.clients.values():
+            record.setdefault("status", "approved")
+            record.setdefault("admin", False)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +210,44 @@ class RelayState:
         if replace or known is None:
             record["public_key"] = public_key
         record["last_seen"] = int(time.time())
+
+    def enroll_client(self, client_id: str, public_key: str, *, client_kind: str = "unknown") -> str:
+        """Atomically admit a key; only an explicitly identified Android endpoint may become first admin."""
+        with self._enrollment_lock:
+            record = self.clients.get(client_id)
+            if record is not None:
+                if record.get("public_key") != public_key:
+                    raise ValueError(f"client public key changed for {client_id}")
+                return "admin" if record.get("admin") else str(record.get("status", "pending"))
+            has_admin = any(item.get("admin") and item.get("status") == "approved" for item in self.clients.values())
+            eligible = client_kind == "android"
+            self.clients[client_id] = {
+                "public_key": public_key,
+                "client_kind": client_kind,
+                "status": "approved" if eligible and not has_admin else "pending",
+                "admin": eligible and not has_admin,
+                "last_seen": int(time.time()),
+            }
+            self.save()
+            return "admin" if eligible and not has_admin else "pending"
+
+    def client_access(self, client_id: str, public_key: str) -> str:
+        record = self.clients.get(client_id)
+        if record is None:
+            return "unknown_endpoint"
+        if record.get("public_key") != public_key:
+            return "endpoint_key_changed"
+        return str(record.get("status", "approved"))
+
+    def set_client_status(self, client_id: str, status: str) -> None:
+        if status not in {"approved", "rejected", "revoked", "pending"}:
+            raise ValueError("invalid endpoint status")
+        if client_id not in self.clients:
+            raise KeyError(client_id)
+        self.clients[client_id]["status"] = status
+        if status != "approved":
+            self.clients[client_id]["admin"] = False
+        self.save()
 
     def queue(self, client_id: str, envelope: dict[str, Any]) -> None:
         queue = self.queues.setdefault(client_id, [])

@@ -19,6 +19,7 @@ from typing import Any, Awaitable, BinaryIO, Callable
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from server.appserve_server.core import build_bootstrap_request, decrypt_bootstrap_response
 
 from .e2e import (
     PeerSession,
@@ -48,14 +49,8 @@ class ServerInfo:
     control_port: int
     relay_port: int
     server_public_key: bytes
-    tls_cert_sha256: str
     deployment_id: str = "private"
     bulk_port: int = 4444
-
-    def __post_init__(self) -> None:
-        if not re.fullmatch(r"[0-9a-f]{64}", self.tls_cert_sha256):
-            raise ValueError("tls_cert_sha256 must be a lowercase SHA-256 fingerprint")
-
 
 @dataclass
 class Wisp:
@@ -196,13 +191,22 @@ class AppserveClient:
         identity_key=None,
         peer_store_path: str | Path | None = None,
         transfer_directory: str | Path | None = None,
+        trust_anchor_path: str | Path | None = None,
+        client_kind: str = "python-wisp",
     ):
         self.info = info
         self.client_id = client_id
-        self._reader: asyncio.StreamReader | None = None
+        self.client_kind = client_kind
+
         self._writer: asyncio.StreamWriter | None = None
         self._wisps: dict[str, Wisp] = {}
         self._identity_key = identity_key or generate_identity()
+        self._trust_anchor_path = Path(trust_anchor_path) if trust_anchor_path else None
+        self._tls_anchor_sha256 = None
+        if self._trust_anchor_path and self._trust_anchor_path.exists():
+            cached = json.loads(self._trust_anchor_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and re.fullmatch(r"[0-9a-f]{64}", str(cached.get("sha256", ""))):
+                self._tls_anchor_sha256 = str(cached["sha256"])
         self._peer_store_path = Path(peer_store_path) if peer_store_path else None
         self._transfer_directory = Path(transfer_directory) if transfer_directory else Path(tempfile.gettempdir()) / "wispgate-transfers"
         self._transfers: dict[tuple[str, str], _IncomingTransfer] = {}
@@ -943,6 +947,7 @@ class AppserveClient:
         payload = json.dumps({
             "deployment_id": self.info.deployment_id,
             "client_id": self.client_id,
+            "client_kind": self.client_kind,
             "client_public_key": public_key_text(self._identity_key),
             "nonce": secrets.token_urlsafe(20),
             "timestamp": int(time.time()),
@@ -958,6 +963,7 @@ class AppserveClient:
     ) -> None:
         await self._send(writer, {
             "type": "auth_hello", "role": role, "client_id": self.client_id,
+            "client_kind": self.client_kind,
             "public_key": public_key_text(self._identity_key),
         })
         await self._complete_auth(reader, writer, role)
@@ -996,6 +1002,8 @@ class AppserveClient:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     async def _open_tls(self, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if self._tls_anchor_sha256 is None:
+            await self._bootstrap_tls()
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
         context.maximum_version = ssl.TLSVersion.TLSv1_3
@@ -1015,11 +1023,46 @@ class AppserveClient:
             raise ssl.SSLError("TLS peer did not present a certificate")
         import hashlib
         actual = hashlib.sha256(certificate).hexdigest()
-        if not secrets.compare_digest(actual, self.info.tls_cert_sha256):
+        if not secrets.compare_digest(actual, self._tls_anchor_sha256 or ""):
             writer.close()
             await writer.wait_closed()
             raise ssl.SSLError("TLS leaf certificate fingerprint mismatch")
         return reader, writer
+
+    async def _bootstrap_tls(self) -> None:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.maximum_version = ssl.TLSVersion.TLSv1_3
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        reader, writer = await asyncio.open_connection(self.info.host, self.info.control_port, ssl=context)
+        nonce = secrets.token_bytes(24)
+        payload = build_bootstrap_request(
+            serialization.load_der_public_key(self.info.server_public_key),
+            self.client_id,
+            self._identity_key.public_key(),
+            nonce,
+            self.client_kind,
+        )
+        try:
+            await self._send(writer, {"type": "bootstrap_request", "payload": payload.decode("ascii")})
+            result = await self._read(reader)
+            if not result.get("ok") or result.get("type") != "bootstrap_response":
+                raise ssl.SSLError(result.get("error", "encrypted bootstrap rejected"))
+            response = decrypt_bootstrap_response(
+                self._identity_key, result["payload"].encode("ascii"), nonce
+            )
+            import hashlib
+            actual = hashlib.sha256(response["certificate_der"]).hexdigest()
+            if actual != response["certificate_sha256"].hex():
+                raise ssl.SSLError("encrypted bootstrap certificate hash mismatch")
+            self._tls_anchor_sha256 = actual
+            if self._trust_anchor_path:
+                self._trust_anchor_path.parent.mkdir(parents=True, exist_ok=True)
+                self._trust_anchor_path.write_text(json.dumps({"sha256": actual}), encoding="utf-8")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     @staticmethod
     async def _read(reader: asyncio.StreamReader) -> dict[str, Any]:
@@ -1041,11 +1084,11 @@ def load(path: str | Path, *, reset_peer_trust: bool = False) -> AppserveClient:
             control_port=int(data.get("control_port", data.get("port", 443))),
             relay_port=int(data.get("relay_port", 4443)),
             server_public_key=base64.urlsafe_b64decode(key),
-            tls_cert_sha256=data["tls_cert_sha256"],
             deployment_id=data.get("deployment_id", "private"),
             bulk_port=int(data.get("bulk_port", 4444)),
         ),
         client_id=client_id,
         identity_key=load_or_create_identity(identity_path),
         peer_store_path=peers_path,
+        trust_anchor_path=config_path.with_name(f".{config_path.stem}-{client_id}-tls-anchor.json"),
     )

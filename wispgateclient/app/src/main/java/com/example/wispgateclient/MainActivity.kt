@@ -122,9 +122,9 @@ private fun WispGateApp(client: RelayClient) {
 
     if (server == null) {
         SetupScreen(
-            onSave = { host, key, tlsCertSha256, controlPort, relayPort, bulkPort ->
+            onSave = { host, key, controlPort, relayPort, bulkPort ->
                 val info = RelayClient.ServerInfo(
-                    host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt(), bulkPort.toInt(), tlsCertSha256.trim(),
+                    host.trim(), key.trim(), controlPort.toInt(), relayPort.toInt(), bulkPort.toInt(),
                 )
                 client.saveServer(info)
                 server = info
@@ -298,10 +298,10 @@ private fun WispGateApp(client: RelayClient) {
 }
 
 @Composable
-private fun SetupScreen(onSave: (String, String, String, String, String, String) -> Unit) {
+private fun SetupScreen(onSave: (String, String, String, String, String) -> Unit) {
     var host by remember { mutableStateOf("") }
     var key by remember { mutableStateOf("") }
-    var tlsCertSha256 by remember { mutableStateOf("") }
+
     var controlPort by remember { mutableStateOf("443") }
     var relayPort by remember { mutableStateOf("4443") }
     var bulkPort by remember { mutableStateOf("4444") }
@@ -316,7 +316,7 @@ private fun SetupScreen(onSave: (String, String, String, String, String, String)
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(key, { key = it }, label = { Text("Relay public key") }, singleLine = true)
         Spacer(Modifier.height(12.dp))
-        OutlinedTextField(tlsCertSha256, { tlsCertSha256 = it }, label = { Text("TLS leaf SHA-256 pin") }, singleLine = true)
+
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(controlPort, { controlPort = it }, label = { Text("Control port") }, singleLine = true)
         Spacer(Modifier.height(12.dp))
@@ -325,9 +325,9 @@ private fun SetupScreen(onSave: (String, String, String, String, String, String)
         OutlinedTextField(bulkPort, { bulkPort = it }, label = { Text("Bulk port") }, singleLine = true)
         Spacer(Modifier.height(20.dp))
         Button(
-            enabled = host.isNotBlank() && key.isNotBlank() && tlsCertSha256.matches(Regex("[0-9a-f]{64}")) && controlPort.toIntOrNull() != null &&
+            enabled = host.isNotBlank() && key.isNotBlank() && controlPort.toIntOrNull() != null &&
                 relayPort.toIntOrNull() != null && bulkPort.toIntOrNull() != null,
-            onClick = { onSave(host, key, tlsCertSha256, controlPort, relayPort, bulkPort) },
+            onClick = { onSave(host, key, controlPort, relayPort, bulkPort) },
         ) {
             Text("Save and connect")
         }
