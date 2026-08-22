@@ -72,21 +72,39 @@ def test_changed_enrolled_endpoint_key_fails_closed(tmp_path: Path) -> None:
     assert state.clients["prime-wisp"]["public_key"] == "real-public-key"
 
 
-def test_relay_routes_opaque_session_envelope_after_acceptance(tmp_path: Path) -> None:
+def test_relay_routes_android_logical_sender_from_authenticated_android_endpoint(tmp_path: Path) -> None:
     relay = runtime(tmp_path)
     sender = RecordingWriter()
     recipient = RecordingWriter()
-    relay.sessions["android-user"] = ("android-user", sender)  # type: ignore[assignment]
+    relay.state.clients["android-endpoint-uuid"] = {"client_kind": "android"}
+    relay.sessions["android-endpoint-uuid"] = ("android-endpoint-uuid", sender)  # type: ignore[assignment]
     relay.sessions["prime-wisp"] = ("prime-wisp", recipient)  # type: ignore[assignment]
     envelope = {
         "version": 1, "type": "session_envelope", "session_id": "s1",
         "sender": "android-user", "recipient": "prime-wisp", "sequence": 0,
         "ciphertext": "opaque-ciphertext-and-tag",
     }
-    asyncio.run(relay.forward("android-user", envelope))
+    asyncio.run(relay.forward("android-endpoint-uuid", envelope))
     assert sender.messages == [{"ok": True, "type": "accepted", "session_id": "s1", "sequence": 0}]
     assert recipient.messages == [envelope]
     assert "body" not in str(recipient.messages)
+
+
+def test_relay_rejects_android_logical_sender_from_non_android_endpoint(tmp_path: Path) -> None:
+    relay = runtime(tmp_path)
+    sender = RecordingWriter()
+    recipient = RecordingWriter()
+    relay.state.clients["python-wisp"] = {"client_kind": "python"}
+    relay.sessions["python-wisp"] = ("python-wisp", sender)  # type: ignore[assignment]
+    relay.sessions["prime-wisp"] = ("prime-wisp", recipient)  # type: ignore[assignment]
+    envelope = {
+        "version": 1, "type": "session_envelope", "session_id": "s1",
+        "sender": "android-user", "recipient": "prime-wisp", "sequence": 0,
+        "ciphertext": "opaque-ciphertext-and-tag",
+    }
+    asyncio.run(relay.forward("python-wisp", envelope))
+    assert sender.messages == [{"ok": False, "error": "invalid_envelope"}]
+    assert recipient.messages == []
 
 
 def test_destination_write_failure_does_not_terminate_source_session(tmp_path: Path) -> None:

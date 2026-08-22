@@ -433,6 +433,7 @@ class RelayRuntime:
             await send_json(writer, {"ok": False, "error": "endpoint_" + access if access in {"pending", "rejected", "revoked"} else access})
             return None
         self.state.register_client(enrolled_id, enrolled_key, replace=False)
+        self.state.clients[enrolled_id]["client_kind"] = enrolled_kind
         self.state.save()
         await send_json(writer, {"ok": True, "type": "authenticated", "client_id": enrolled_id})
         return enrolled_id
@@ -550,8 +551,7 @@ class RelayRuntime:
             required = {"type", "sender", "recipient", "reason"}
             allowed = required
             valid_shape = (
-                envelope.get("sender") == sender
-                and isinstance(envelope.get("reason"), str)
+                isinstance(envelope.get("reason"), str)
                 and 1 <= len(envelope.get("reason")) <= 128
             )
         else:
@@ -559,9 +559,17 @@ class RelayRuntime:
             allowed = required | {"sender_public_key"}
             valid_shape = envelope.get("type") == "envelope"
 
+        authenticated_record = self.state.clients.get(sender, {})
+        sender_matches_transport = envelope.get("sender") == sender
+        sender_matches_android_logical_id = (
+            envelope.get("sender") == "android-user"
+            and authenticated_record.get("client_kind") == "android"
+        )
+        if envelope.get("type") == "session_reset":
+            valid_shape = valid_shape and (sender_matches_transport or sender_matches_android_logical_id)
         if (
             not recipient
-            or envelope.get("sender") != sender
+            or not (sender_matches_transport or sender_matches_android_logical_id)
             or not valid_shape
             or not set(envelope).issubset(allowed)
             or not required.issubset(envelope)
