@@ -97,6 +97,36 @@ def test_server_update_is_management_action_not_generic_control_action(tmp_path:
     assert runtime.management_request("endpoint", {"action": "update_server"})["ok"] is True
 
 
+def test_server_update_reports_unconfigured_hook(tmp_path: Path) -> None:
+    state = RelayState(tmp_path / "state.json")
+    runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=True), state)
+    key = public_key_text(generate_identity())
+    state.enroll_client("endpoint", key, client_kind="android")
+    state.claim_admin("endpoint")
+
+    assert runtime.management_request("endpoint", {"action": "update_server"}) == {
+        "ok": False,
+        "error": "update_unconfigured",
+    }
+
+
+def test_server_update_reports_launch_failure(tmp_path: Path) -> None:
+    state = RelayState(tmp_path / "state.json")
+    runtime = RelayRuntime(
+        RelayConfig(b"", enrollment_enabled=True),
+        state,
+        update_command=(str(tmp_path / "missing-update-script"),),
+    )
+    key = public_key_text(generate_identity())
+    state.enroll_client("endpoint", key, client_kind="android")
+    state.claim_admin("endpoint")
+
+    assert runtime.management_request("endpoint", {"action": "update_server"}) == {
+        "ok": False,
+        "error": "update_launch_failed",
+    }
+
+
 def test_management_operations_control_pending_endpoints_and_registered_wisps(tmp_path: Path) -> None:
     state = RelayState(tmp_path / "state.json")
     runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=True), state)

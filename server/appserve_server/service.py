@@ -126,8 +126,14 @@ class RelayRuntime:
             return {"ok": False, "error": "management_unauthorized"}
         if action == "update_server":
             if not self.update_command:
+                LOG.error("server update requested but no update command is configured")
                 return {"ok": False, "error": "update_unconfigured"}
-            subprocess.Popen(self.update_command, start_new_session=True)
+            try:
+                subprocess.Popen(self.update_command, start_new_session=True)
+            except OSError:
+                LOG.exception("unable to launch configured server update command: %s", self.update_command)
+                return {"ok": False, "error": "update_launch_failed"}
+            LOG.info("server update requested by administrator")
             return {"ok": True, "type": "update_started"}
         if action == "list_endpoints":
             return {"ok": True, "endpoints": [{"client_id": key, **value} for key, value in self.state.clients.items()]}

@@ -152,10 +152,18 @@ private fun WispGateApp(client: RelayClient) {
         WebAppScreen(
             wisp = selected!!,
             state = wispState!!,
+            error = error,
             onAction = { action ->
                 scope.launch {
+                    error = null
                     try {
-                        replaceWispState(client.sendAction(server!!, selected!!, action))
+                        val next = client.sendAction(server!!, selected!!, action)
+                        replaceWispState(next)
+                        if (selected?.id == RelayClient.MANAGEMENT_WISP_ID &&
+                            runCatching { org.json.JSONObject(action).optString("action") }.getOrNull() == "update_server"
+                        ) {
+                            error = "Update request sent; the relay may restart briefly."
+                        }
                     } catch (cause: Throwable) {
                         error = cause.message ?: "Unable to send Wisp action"
                     }
@@ -326,6 +334,7 @@ private fun SetupScreen(onSave: (String, String, String, String, String) -> Unit
 private fun WebAppScreen(
     wisp: RelayClient.Wisp,
     state: RelayClient.WispState,
+    error: String?,
     onAction: (String) -> Unit,
     onFileAction: (StagedFileAction) -> Unit,
     onBack: () -> Unit,
@@ -350,6 +359,14 @@ private fun WebAppScreen(
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Button(onClick = onBack) { Text("Back") }
             Text(wisp.name, Modifier.padding(start = 12.dp), style = MaterialTheme.typography.titleLarge)
+        }
+        error?.let {
+            Text(
+                it,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                color = if (it.startsWith("Update request sent")) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.error,
+            )
         }
         androidx.compose.runtime.key(state) {
             AndroidView(
