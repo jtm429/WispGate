@@ -5,8 +5,8 @@ import base64
 import json
 from pathlib import Path
 
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from appserve.e2e import generate_identity, public_key_text
 from server.appserve_server.core import RelayConfig, RelayState
@@ -146,7 +146,17 @@ def test_pending_endpoint_cannot_join_control_or_relay(tmp_path: Path) -> None:
 def test_management_control_frame_path_is_socket_level(tmp_path: Path) -> None:
     async def scenario() -> None:
         state = RelayState(tmp_path / "state.json")
-        runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=False), state)
+        runtime = RelayRuntime(
+            RelayConfig(
+                rsa.generate_private_key(65537, 2048).private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                ),
+                enrollment_enabled=False,
+            ),
+            state,
+        )
         identity = generate_identity()
         state.enroll_client("android-device", public_key_text(identity), client_kind="android")
         server = await asyncio.start_server(runtime.handle_control, "127.0.0.1", 0)
@@ -159,6 +169,10 @@ def test_management_control_frame_path_is_socket_level(tmp_path: Path) -> None:
             writer.write((json.dumps({"type": "auth_proof", "signature": sign_auth(identity, "control", "android-device", challenge)}) + "\n").encode())
             await writer.drain()
             assert json.loads(await reader.readline())["ok"] is True
+            writer.write((json.dumps({"type": "join", "client_id": "android-device"}) + "\n").encode())
+            await writer.drain()
+            joined = json.loads(await reader.readline())
+            assert joined["ok"] is True
             writer.write((json.dumps({"type": "management_request", "request": {"action": "claim_admin"}}) + "\n").encode())
             await writer.drain()
             response = json.loads(await reader.readline())

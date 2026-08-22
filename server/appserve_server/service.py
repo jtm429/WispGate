@@ -265,6 +265,9 @@ class RelayRuntime:
             registration = await asyncio.wait_for(reader.readline(), timeout=2)
             if registration:
                 message = json.loads(registration)
+                if message.get("type") == "management_request":
+                    await send_json(writer, {"type": "management_response", **self.management_request(client_id, message.get("request", {}))})
+                    return
                 if message.get("type") == "wisps":
                     if message.get("client_public_key"):
                         self.state.register_client(client_id, message["client_public_key"])
