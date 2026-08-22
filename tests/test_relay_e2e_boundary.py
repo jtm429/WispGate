@@ -46,10 +46,22 @@ def test_catalog_distributes_only_enrolled_endpoint_public_keys(tmp_path: Path) 
     key = public_key_text(generate_identity())
     relay.state.clients["prime-wisp"] = {"public_key": key}
     relay.state.wisps["prime"] = {"id": "prime", "name": "Prime", "description": "", "owner": "prime-wisp"}
+    relay.sessions["prime-wisp"] = ("prime-wisp", RecordingWriter())  # type: ignore[assignment]
     assert relay.catalog_items()[0]["public_key"] == key
     relay.state.clients["legacy"] = {"public_key": "legacy"}
     relay.state.wisps["legacy-wisp"] = {"id": "legacy-wisp", "owner": "legacy"}
     assert all(item["owner"] != "legacy" for item in relay.catalog_items())
+
+
+def test_catalog_excludes_registered_wisp_without_live_session(tmp_path: Path) -> None:
+    relay = runtime(tmp_path)
+    key = public_key_text(generate_identity())
+    relay.state.clients["stopped-wisp"] = {"public_key": key, "status": "approved"}
+    relay.state.wisps["stopped"] = {
+        "id": "stopped", "name": "Stopped", "description": "", "owner": "stopped-wisp",
+    }
+
+    assert relay.catalog_items() == []
 
 
 def test_changed_enrolled_endpoint_key_fails_closed(tmp_path: Path) -> None:

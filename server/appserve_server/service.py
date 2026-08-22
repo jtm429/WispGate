@@ -68,6 +68,12 @@ class RelayRuntime:
             items.append({"id": "management", "name": "Management", "description": "Claim administrator access and manage server Wisps", "owner": "__server__", "public_key": self.config.public_key_text()})
         for manifest in self.state.wisps.values():
             owner = manifest.get("owner")
+            # ``state.wisps`` is durable registration metadata, not an online
+            # presence list.  Only advertise a Wisp while its runtime has a
+            # live relay session; otherwise clients retain dead/stale Wisps
+            # after an endpoint has stopped or before it has connected.
+            if not owner or owner not in self.sessions:
+                continue
             if client_id and not self._endpoint_usable(client_id):
                 continue
             if owner and not self._endpoint_usable(owner):
@@ -96,7 +102,11 @@ class RelayRuntime:
                 return {"ok": True, "client_id": client_id, **record}
             admin = self._is_admin(client_id)
             endpoints = [{"client_id": key, **value} for key, value in self.state.clients.items()] if admin else []
-            wisps = list(self.state.wisps.values()) if admin else []
+            wisps = [
+                manifest
+                for manifest in self.state.wisps.values()
+                if manifest.get("owner") in self.sessions
+            ] if admin else []
             return {
                 "ok": True,
                 "client_id": client_id,
@@ -185,7 +195,7 @@ class RelayRuntime:
                     if endpoint_status != "revoked":
                         item += button({"action": "revoke", "client_id": client_id}, "Revoke")
                 out.append(item + "</li>")
-            out.append("</ul><h2>Registered Wisps</h2><ul>")
+            out.append("</ul><h2>Active Wisps</h2><ul>")
             for wisp in sorted(wisps, key=lambda item: item.get("id", "")):
                 wisp_id = str(wisp.get("id", ""))
                 out.append(
