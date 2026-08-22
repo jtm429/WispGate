@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import subprocess
 from pathlib import Path
 
 from .core import RelayConfig, RelayState
@@ -37,6 +38,14 @@ def main() -> None:
     state = RelayState(args.state)
     state.load()
     update_command = ("/usr/bin/sudo", "-n", str(args.update_script)) if args.update_script else None
+    try:
+        server_version = subprocess.check_output(
+            ("git", "rev-parse", "--short", "HEAD"),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        server_version = "unknown"
     runtime = RelayRuntime(
         RelayConfig(
             key,
@@ -45,6 +54,7 @@ def main() -> None:
         ),
         state,
         update_command=update_command,
+        server_version=server_version,
     )
     asyncio.run(serve(
         runtime,

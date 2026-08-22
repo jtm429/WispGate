@@ -49,6 +49,7 @@ class RelayRuntime:
     sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
     control_sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
     update_command: tuple[str, ...] | None = None
+    server_version: str = "unknown"
     pending_bulk: dict[str, "_BulkConnection"] = field(default_factory=dict)
     consumed_bulk: dict[str, float] = field(default_factory=dict)
     bulk_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -124,6 +125,8 @@ class RelayRuntime:
             return {"ok": False, "error": result}
         if not self._is_admin(client_id):
             return {"ok": False, "error": "management_unauthorized"}
+        if action == "current_server_version":
+            return {"ok": True, "type": "server_version", "version": self.server_version}
         if action == "update_server":
             if not self.update_command:
                 LOG.error("server update requested but no update command is configured")
@@ -174,8 +177,7 @@ class RelayRuntime:
             return {"ok": True, "id": wisp_id}
         return {"ok": False, "error": "unknown_management_action"}
 
-    @staticmethod
-    def _management_html(record: dict[str, Any], endpoints: list[dict[str, Any]], wisps: list[dict[str, Any]], *, admin: bool) -> str:
+    def _management_html(self, record: dict[str, Any], endpoints: list[dict[str, Any]], wisps: list[dict[str, Any]], *, admin: bool) -> str:
         esc = html.escape
 
         def button(action: dict[str, Any], label: str) -> str:
@@ -187,7 +189,15 @@ class RelayRuntime:
         out = ["<main><h1>Management</h1>", f"<p>Status: <strong>{status}</strong>"]
         if admin:
             out.append(" · Administrator</p><h2>Server administration</h2>")
-            out.append(button({"action": "update_server"}, "Update server"))
+            out.append(
+                '<p>Server version: <code>'
+                + esc(self.server_version)
+                + "</code></p><p>"
+                + button({"action": "current_server_version"}, "Current server version")
+                + " "
+                + button({"action": "update_server"}, "Update server")
+                + "</p>"
+            )
             out.append("<h2>Endpoints</h2><ul>")
             for endpoint in sorted(endpoints, key=lambda item: item.get("client_id", "")):
                 client_id = str(endpoint.get("client_id", ""))

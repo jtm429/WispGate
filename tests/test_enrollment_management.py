@@ -82,7 +82,38 @@ def test_management_state_is_server_owned_and_has_role_specific_controls(tmp_pat
     admin = runtime.management_request("pending", {"action": "state"})
     assert "Administrator" in admin["html"]
     assert "Update server" in admin["html"]
+    assert "Current server version" in admin["html"]
     assert "Claim Administrator" not in admin["html"]
+
+
+def test_current_server_version_is_management_action(tmp_path: Path) -> None:
+    state = RelayState(tmp_path / "state.json")
+    runtime = RelayRuntime(
+        RelayConfig(b"", enrollment_enabled=True),
+        state,
+        server_version="eaca720",
+    )
+    key = public_key_text(generate_identity())
+    state.enroll_client("endpoint", key, client_kind="android")
+    state.claim_admin("endpoint")
+
+    result = runtime.management_request("endpoint", {"action": "current_server_version"})
+
+    assert result == {"ok": True, "type": "server_version", "version": "eaca720"}
+    assert "eaca720" in runtime.management_request("endpoint", {"action": "state"})["html"]
+
+
+def test_management_state_includes_endpoint_controls(tmp_path: Path) -> None:
+    state = RelayState(tmp_path / "state.json")
+    runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=True), state)
+    admin_key = public_key_text(generate_identity())
+    pending_key = public_key_text(generate_identity())
+    state.enroll_client("admin", admin_key, client_kind="android")
+    state.enroll_client("pending", pending_key, client_kind="android")
+    state.claim_admin("admin")
+
+    admin = runtime.management_request("admin", {"action": "state"})
+
     assert "Approve" in admin["html"]
     assert "Revoke" in admin["html"]
 
