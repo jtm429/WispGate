@@ -47,6 +47,7 @@ class RelayRuntime:
     config: RelayConfig
     state: RelayState
     sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
+    relay_liveness: dict[str, float] = field(default_factory=dict)
     control_sessions: dict[str, tuple[str, asyncio.StreamWriter]] = field(default_factory=dict)
     update_command: tuple[str, ...] | None = None
     server_version: str = "unknown"
@@ -73,7 +74,7 @@ class RelayRuntime:
             # presence list.  Only advertise a Wisp while its runtime has a
             # live relay session; otherwise clients retain dead/stale Wisps
             # after an endpoint has stopped or before it has connected.
-            if not owner or owner not in self.sessions:
+            if not owner or not self._relay_online(owner):
                 continue
             if client_id and not self._endpoint_usable(client_id):
                 continue
@@ -89,6 +90,10 @@ class RelayRuntime:
         status = self.state.clients.get(client_id, {}).get("status", "approved")
         return status == "approved" or (include_pending and status == "pending")
 
+    def _relay_online(self, client_id: str) -> bool:
+        last_seen = self.relay_liveness.get(client_id)
+        return last_seen is not None and time.monotonic() - last_seen <= self.HEARTBEAT_TIMEOUT_SECONDS
+
     def _is_admin(self, client_id: str) -> bool:
         record = self.state.clients.get(client_id, {})
         return bool(record.get("admin")) and self._endpoint_usable(client_id)
@@ -103,10 +108,13 @@ class RelayRuntime:
                 return {"ok": True, "client_id": client_id, **record}
             admin = self._is_admin(client_id)
             endpoints = [{"client_id": key, **value} for key, value in self.state.clients.items()] if admin else []
+            # The renderer needs the authoritative endpoint identity so it can
+            # avoid offering self-destructive controls for the administrator.
+            record = {"client_id": client_id, **record}
             wisps = [
                 manifest
                 for manifest in self.state.wisps.values()
-                if manifest.get("owner") in self.sessions
+                if self._relay_online(manifest.get("owner", ""))
             ] if admin else []
             return {
                 "ok": True,
@@ -295,10 +303,22 @@ class RelayRuntime:
                     await send_json(writer, {"type": "management_response", **self.management_request(client_id, message.get("request", {}))})
                     return
                 if message.get("type") == "wisps":
+                    items = message.get("items", [])
+                    LOG.info(
+                        "wisp registration received client_id=%s type=%s item_count=%d item_ids=%s item_owners=%s item_public_key_present=%s client_public_key_present=%s state_wisps_before=%s",
+                        client_id,
+                        message.get("type"),
+                        len(items) if isinstance(items, list) else -1,
+                        [item.get("id") for item in items if isinstance(item, dict)],
+                        [item.get("owner") for item in items if isinstance(item, dict)],
+                        [bool(item.get("public_key")) for item in items if isinstance(item, dict)],
+                        bool(message.get("client_public_key")),
+                        sorted(self.state.wisps.keys()),
+                    )
                     if message.get("client_public_key"):
                         self.state.register_client(client_id, message["client_public_key"])
                     self.state.remove_wisps_for_owner(client_id)
-                    for item in message.get("items", []):
+                    for item in items:
                         if item.get("id"):
                             self.state.wisps[item["id"]] = {
                                 "id": item["id"],
@@ -307,7 +327,14 @@ class RelayRuntime:
                                 "owner": client_id,
                             }
                     self.state.save()
-                    await send_json(writer, {"ok": True, "type": "wisps_registered", "items": self.catalog_items(client_id)})
+                    catalog = self.catalog_items(client_id)
+                    LOG.info(
+                        "wisp registration applied client_id=%s state_wisps_after=%s catalog_ids=%s",
+                        client_id,
+                        sorted(self.state.wisps.keys()),
+                        [item.get("id") for item in catalog],
+                    )
+                    await send_json(writer, {"ok": True, "type": "wisps_registered", "items": catalog})
                     await self.broadcast_catalog()
                     if self._is_admin(client_id) or self.state.clients.get(client_id, {}).get("status") == "pending":
                         if self._is_admin(client_id):
@@ -336,6 +363,7 @@ class RelayRuntime:
 
     async def broadcast_catalog(self) -> None:
         message = {"ok": True, "type": "catalog_update", "items": self.catalog_items()}
+        LOG.info("broadcasting catalog_update items=%s control_clients=%s", [item.get("id") for item in message["items"]], sorted(self.control_sessions))
         stale: list[str] = []
         for client_id, (_, writer) in list(self.control_sessions.items()):
             try:
@@ -355,15 +383,18 @@ class RelayRuntime:
             if client_id is None:
                 return
             self.sessions[client_id] = (client_id, writer)
+            self.relay_liveness[client_id] = time.monotonic()
             self.state.clients[client_id]["last_seen"] = int(asyncio.get_running_loop().time())
             await send_json(writer, {"ok": True, "type": "ready", "client_id": client_id})
             for queued in self.state.drain(client_id):
                 await send_json(writer, queued)
             self.state.save()
             LOG.info("relay connected: %s from %s", client_id, peer)
+            await self.broadcast_catalog()
             while line := await asyncio.wait_for(
                 reader.readline(), timeout=self.HEARTBEAT_TIMEOUT_SECONDS
             ):
+                self.relay_liveness[client_id] = time.monotonic()
                 message = json.loads(line)
                 if message.get("type") == "ping":
                     nonce = message.get("nonce")
@@ -378,13 +409,14 @@ class RelayRuntime:
                     await send_json(writer, {"ok": False, "error": "invalid_envelope"})
                     continue
                 await self.forward(client_id, message)
+            LOG.info("relay connection EOF for %s", client_id or peer)
         except (asyncio.TimeoutError, ConnectionError, json.JSONDecodeError) as exc:
             LOG.info("relay connection ended for %s: %s", client_id or peer, exc)
         finally:
             if client_id and self.sessions.get(client_id, (None, None))[1] is writer:
                 self.sessions.pop(client_id, None)
-                self.state.remove_wisps_for_owner(client_id)
-                self.state.save()
+                self.relay_liveness.pop(client_id, None)
+                LOG.info("relay session offline for %s; retaining durable Wisp registrations", client_id)
                 await self.broadcast_catalog()
             writer.close()
             await writer.wait_closed()
@@ -569,17 +601,12 @@ class RelayRuntime:
             allowed = required | {"sender_public_key"}
             valid_shape = envelope.get("type") == "envelope"
 
-        authenticated_record = self.state.clients.get(sender, {})
         sender_matches_transport = envelope.get("sender") == sender
-        sender_matches_android_logical_id = (
-            envelope.get("sender") == "android-user"
-            and authenticated_record.get("client_kind") == "android"
-        )
         if envelope.get("type") == "session_reset":
-            valid_shape = valid_shape and (sender_matches_transport or sender_matches_android_logical_id)
+            valid_shape = valid_shape and sender_matches_transport
         if (
             not recipient
-            or not (sender_matches_transport or sender_matches_android_logical_id)
+            or not sender_matches_transport
             or not valid_shape
             or not set(envelope).issubset(allowed)
             or not required.issubset(envelope)
@@ -610,8 +637,7 @@ class RelayRuntime:
                 LOG.info("relay destination disconnected while forwarding %s -> %s: %s", sender, recipient, exc)
                 if self.sessions.get(recipient, (None, None))[1] is destination[1]:
                     self.sessions.pop(recipient, None)
-                    self.state.remove_wisps_for_owner(recipient)
-                    self.state.save()
+                    self.relay_liveness.pop(recipient, None)
                     await self.broadcast_catalog()
                 destination[1].close()
                 try:

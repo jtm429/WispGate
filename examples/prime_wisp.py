@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from appserve import Wisp
+from appserve import Wisp, WispContext
 
 
 class PrimeWisp:
@@ -43,10 +43,10 @@ class PrimeWisp:
             """.strip(),
         }
 
-    def state(self) -> dict[str, str]:
+    def state(self, context: WispContext) -> dict[str, str]:
         return self.current
 
-    def action(self, action: dict[str, str]) -> dict[str, str]:
+    def action(self, action: dict[str, str], context: WispContext) -> dict[str, str]:
         if action.get("type") == "submit":
             raw = action.get("number", "")
             try:

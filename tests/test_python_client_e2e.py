@@ -72,6 +72,7 @@ async def establish_peer_session(client: AppserveClient, android_identity, wisp_
         android_to_wisp,
         wisp_to_android,
         created_at=client._peer_sessions["android-user"].created_at,
+            android_side=True,
     )
 
 
@@ -452,10 +453,12 @@ def test_waiting_completion_encrypts_with_replacement_peer_session(tmp_path: Pat
         client._peer_sessions["android-user"] = PeerSession(
             "replacement-session", "prime-wisp", "android-user",
             android_to_wisp, wisp_to_android, created_at=created_at,
+            android_side=False,
         )
         replacement_peer = PeerSession(
             "replacement-session", "android-user", "prime-wisp",
             android_to_wisp, wisp_to_android, created_at=created_at,
+            android_side=True,
         )
         replacement_writer = RecordingWriter()
         client._writer = replacement_writer  # type: ignore[assignment]

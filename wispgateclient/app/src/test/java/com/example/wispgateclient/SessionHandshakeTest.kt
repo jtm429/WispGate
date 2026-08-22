@@ -15,7 +15,7 @@ class SessionHandshakeTest {
         val android = identity()
         val wisp = identity()
         val pending = SessionHandshake.begin(
-            owner = "prime-wisp", peerPublicKey = E2EEnvelope.publicKeyText(wisp.public),
+            localId = "android-endpoint-uuid", owner = "prime-wisp", peerPublicKey = E2EEnvelope.publicKeyText(wisp.public),
             identity = android, nowMillis = 1000L,
             master = ByteArray(32) { it.toByte() }, sessionId = "session-1", challenge = "challenge-1",
         )
@@ -24,9 +24,9 @@ class SessionHandshakeTest {
         assertEquals("session-1", init.getString("session_id"))
         val acceptBody = JSONObject().put("type", "session_accept").put("session_id", "session-1")
             .put("challenge", "challenge-1")
-            .put("proof", SessionCrypto.acceptProof(ByteArray(32) { it.toByte() }, "session-1", "challenge-1", "android-user", "prime-wisp"))
+            .put("proof", SessionCrypto.acceptProof(ByteArray(32) { it.toByte() }, "session-1", "challenge-1", "android-endpoint-uuid", "prime-wisp"))
         val accept = E2EEnvelope.encrypt(
-            "prime-wisp", "android-user", "accept-1", acceptBody,
+            "prime-wisp", "android-endpoint-uuid", "accept-1", acceptBody,
             E2EEnvelope.publicKeyText(android.public), wisp.private, wisp.public, false,
         )
 
@@ -42,11 +42,11 @@ class SessionHandshakeTest {
         val android = identity()
         val wisp = identity()
         val pending = SessionHandshake.begin(
-            "prime-wisp", E2EEnvelope.publicKeyText(wisp.public), android, 1000L,
+            "android-endpoint-uuid", "prime-wisp", E2EEnvelope.publicKeyText(wisp.public), android, 1000L,
             ByteArray(32) { it.toByte() }, "session-1", "challenge-1",
         )
         val bad = E2EEnvelope.encrypt(
-            "prime-wisp", "android-user", "accept-1",
+            "prime-wisp", "android-endpoint-uuid", "accept-1",
             JSONObject().put("type", "session_accept").put("session_id", "session-1")
                 .put("challenge", "challenge-1").put("proof", "wrong"),
             E2EEnvelope.publicKeyText(android.public), wisp.private, wisp.public, false,

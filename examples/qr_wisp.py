@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import qrcode
 
-from appserve import Wisp, WispAsset, WispResponse
+from appserve import Wisp, WispAsset, WispContext, WispResponse
 
 
 class QrWisp:
@@ -51,10 +51,10 @@ class QrWisp:
             assets=(WispAsset.from_bytes("qr-code", "qr.png", "image/png", png),),
         )
 
-    def state(self) -> WispResponse | dict[str, str]:
+    def state(self, context: WispContext) -> WispResponse | dict[str, str]:
         return self.current
 
-    def action(self, action: dict[str, str]) -> WispResponse | dict[str, str]:
+    def action(self, action: dict[str, str], context: WispContext) -> WispResponse | dict[str, str]:
         action_type = action.get("type")
         if action_type == "make_another":
             self.current = self._form()

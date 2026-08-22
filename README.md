@@ -1,3 +1,22 @@
+# WispGate
+
+WispGate is the shared relay, Python runtime, Android runtime, and protocol source of truth.
+
+## Repository layout
+
+- `server/appserve_server/` — relay, endpoint authentication, durable registration, liveness, catalog, and bulk pairing
+- `appserve/` — Python Wisp runtime and application callback boundary
+- `wispgateclient/` — Android runtime/client
+- `tests/` — Python and relay tests
+- `docs/protocol/` — normative protocol contracts and fixtures
+
+Start with [docs/architecture.md](docs/architecture.md), [docs/protocol/README.md](docs/protocol/README.md), and [docs/wisp-authoring.md](docs/wisp-authoring.md).
+
+```bash
+python -m pytest -q
+cd wispgateclient && ./gradlew testDebugUnitTest
+```
+
 # Applet Server
 
 This directory defines a private, personal applet platform. It is not a public app marketplace and it is not a conventional website-hosting system.

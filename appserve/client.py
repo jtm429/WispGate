@@ -19,8 +19,7 @@ from typing import Any, Awaitable, BinaryIO, Callable
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from server.appserve_server.core import build_bootstrap_request, decrypt_bootstrap_response
-
+from .bootstrap import build_bootstrap_request, decrypt_bootstrap_response
 from .e2e import (
     PeerSession,
     decrypt_envelope,
@@ -37,9 +36,17 @@ LOG = logging.getLogger(__name__)
 _ASSET_ID_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 
 
-async def _invoke_wisp_callback(callback: Callable[..., Any], *args: Any) -> Any:
-    """Keep synchronous Wisp code from blocking relay and control I/O."""
-    result = await asyncio.to_thread(callback, *args)
+async def _invoke_wisp_callback(
+    callback: Callable[..., Any], *args: Any, context: "WispContext"
+) -> Any:
+    """Invoke context-aware callbacks while temporarily supporting legacy Wisps."""
+    try:
+        inspect.signature(callback).bind(*args, context)
+    except (TypeError, ValueError):
+        callback_args = args
+    else:
+        callback_args = (*args, context)
+    result = await asyncio.to_thread(callback, *callback_args)
     return await result if inspect.isawaitable(result) else result
 
 
@@ -52,13 +59,20 @@ class ServerInfo:
     deployment_id: str = "private"
     bulk_port: int = 4444
 
+@dataclass(frozen=True)
+class WispContext:
+    """Trusted context derived from the authenticated transport peer."""
+
+    peer_id: str
+
+
 @dataclass
 class Wisp:
     id: str
     name: str
     description: str
-    state: Callable[[], "WispResponse | dict[str, Any]"]
-    action: Callable[[dict[str, Any]], Awaitable["WispResponse | dict[str, Any]"] | "WispResponse | dict[str, Any]"]
+    state: Callable[..., "WispResponse | dict[str, Any]"]
+    action: Callable[..., Awaitable["WispResponse | dict[str, Any]"] | "WispResponse | dict[str, Any]"]
 
     def manifest(self) -> dict[str, str]:
         return {"id": self.id, "name": self.name, "description": self.description}
@@ -399,7 +413,8 @@ class AppserveClient:
             raise ValueError("invalid session master secret")
         android_to_wisp, wisp_to_android = derive_session_keys(master, session_id)
         self._peer_sessions[sender] = PeerSession(
-            session_id, self.client_id, sender, android_to_wisp, wisp_to_android, created_at=time.monotonic()
+            session_id, self.client_id, sender, android_to_wisp, wisp_to_android,
+            created_at=time.monotonic(), android_side=False
         )
         await self._send_envelope(sender, {
             "type": "session_accept", "session_id": session_id, "challenge": challenge,
@@ -471,7 +486,7 @@ class AppserveClient:
                 })
             return
         if action_kind == "state_request":
-            state = await _invoke_wisp_callback(wisp.state)
+            state = await _invoke_wisp_callback(wisp.state, context=WispContext(sender))
         elif action_kind == "file_begin":
             transfer_id = str(body.get("transfer_id", ""))
             completed = self._completed_operations.get((sender, transfer_id))
@@ -516,7 +531,11 @@ class AppserveClient:
                 return
             self._active_operations.add(key)
             try:
-                state = await _invoke_wisp_callback(wisp.action, WispAction(body.get("action_data", {})))
+                state = await _invoke_wisp_callback(
+                    wisp.action,
+                    WispAction(body.get("action_data", {})),
+                    context=WispContext(sender),
+                )
             except Exception:
                 retained = self._operation_status_body(wisp, "indeterminate", operation_id)
                 self._remember_completed_operation(sender, operation_id, retained)
@@ -630,6 +649,7 @@ class AppserveClient:
                 state = await _invoke_wisp_callback(
                     transfer.wisp.action,
                     WispAction(transfer.action_data, exposed),
+                    context=WispContext(transfer.sender),
                 )
             except asyncio.CancelledError:
                 raise

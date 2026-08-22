@@ -14,10 +14,10 @@ import javax.crypto.spec.SecretKeySpec
 
 class PeerSessionFailure(message: String, cause: Throwable? = null) : RecoverableSessionFailure(message, cause)
 
-internal fun requirePeerApplicationFrame(frame: JSONObject, expectedPeer: String): JSONObject {
+internal fun requirePeerApplicationFrame(frame: JSONObject, expectedPeer: String, expectedLocalId: String): JSONObject {
     if (frame.optString("type") != "session_reset") return frame
     if (frame.optString("sender") != expectedPeer ||
-        frame.optString("recipient") != "android-user" ||
+        frame.optString("recipient") != expectedLocalId ||
         frame.optString("reason") != "unknown_session"
     ) {
         throw SecurityException("Invalid session reset")
@@ -104,6 +104,7 @@ object SessionCrypto {
 
 object SessionHandshake {
     data class Pending(
+        val localId: String,
         val owner: String,
         val peerPublicKey: String,
         internal val identity: KeyPair,
@@ -115,6 +116,7 @@ object SessionHandshake {
     )
 
     fun begin(
+        localId: String,
         owner: String,
         peerPublicKey: String,
         identity: KeyPair,
@@ -127,26 +129,26 @@ object SessionHandshake {
         val body = JSONObject().put("type", "session_init").put("session_id", sessionId)
             .put("master_secret", SessionCrypto.encode64(master)).put("challenge", challenge)
         val envelope = E2EEnvelope.encrypt(
-            "android-user", owner, UUID.randomUUID().toString(), body, peerPublicKey,
+            localId, owner, UUID.randomUUID().toString(), body, peerPublicKey,
             identity.private, identity.public, true,
         )
-        return Pending(owner, peerPublicKey, identity, master.copyOf(), sessionId, challenge, nowMillis, envelope)
+        return Pending(localId, owner, peerPublicKey, identity, master.copyOf(), sessionId, challenge, nowMillis, envelope)
     }
 
     fun finish(pending: Pending, envelope: JSONObject, nowMillis: Long): PeerSession {
         if (nowMillis >= pending.createdAtMillis + SessionCrypto.LIFETIME_MILLIS ||
-            envelope.optString("sender") != pending.owner || envelope.optString("recipient") != "android-user") {
+            envelope.optString("sender") != pending.owner || envelope.optString("recipient") != pending.localId) {
             throw SecurityException("Invalid session acceptance route or lifetime")
         }
         val body = E2EEnvelope.decrypt(envelope, pending.identity.private, pending.peerPublicKey).body
         if (body.optString("type") != "session_accept" || body.optString("session_id") != pending.sessionId ||
             body.optString("challenge") != pending.challenge) throw SecurityException("Invalid session acceptance")
-        val expected = SessionCrypto.acceptProof(pending.master, pending.sessionId, pending.challenge, "android-user", pending.owner)
+        val expected = SessionCrypto.acceptProof(pending.master, pending.sessionId, pending.challenge, pending.localId, pending.owner)
         if (!MessageDigest.isEqual(expected.toByteArray(), body.optString("proof").toByteArray())) {
             throw SecurityException("Invalid session acceptance proof")
         }
-        return PeerSession(pending.sessionId, "android-user", pending.owner,
-            SessionCrypto.deriveKeys(pending.master, pending.sessionId), pending.createdAtMillis)
+        return PeerSession(pending.sessionId, pending.localId, pending.owner,
+            SessionCrypto.deriveKeys(pending.master, pending.sessionId), pending.createdAtMillis, androidSide = true)
     }
 }
 
@@ -156,8 +158,8 @@ class PeerSession(
     internal val peerId: String,
     keys: SessionCrypto.Keys,
     private val createdAtMillis: Long,
+    private val androidSide: Boolean,
 ) {
-    private val androidSide = localId == "android-user"
     private val sendKey = if (androidSide) keys.androidToWisp else keys.wispToAndroid
     private val receiveKey = if (androidSide) keys.wispToAndroid else keys.androidToWisp
     private var sendSequence = 0L

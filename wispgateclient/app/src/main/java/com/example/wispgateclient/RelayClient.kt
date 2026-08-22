@@ -211,7 +211,9 @@ class RelayClient(private val context: Context) {
             val request = runCatching { JSONObject(action) }.getOrElse {
                 return@serialized requestManagementState(info, "Invalid management action")
             }
-            val result = managementRequest(info, request)
+            val result = withContext(Dispatchers.IO) {
+                managementRequest(info, request)
+            }
             return@serialized requestManagementState(
                 info,
                 result.takeUnless { it.optBoolean("ok") }?.optString("error"),
@@ -441,7 +443,7 @@ class RelayClient(private val context: Context) {
         stage: String,
     ): JSONObject =
         try {
-            val frame = requirePeerApplicationFrame(input.readJson(output, stage), session.peerId)
+            val frame = requirePeerApplicationFrame(input.readJson(output, stage), session.peerId, clientId)
             session.decrypt(frame, SystemClock.elapsedRealtime())
         } catch (cause: Exception) {
             throw PeerSessionFailure("Peer session failed while waiting for $stage", cause)
@@ -463,7 +465,7 @@ class RelayClient(private val context: Context) {
         val now = SystemClock.elapsedRealtime()
         RelayOperationCoordinator.peerSessions[cacheKey]?.takeUnless { it.isExpired(now) }?.let { return it }
         RelayOperationCoordinator.peerSessions.keys.removeAll { it.startsWith("$owner:") }
-        val pending = SessionHandshake.begin(owner, peerPublicKey, identity, now)
+        val pending = SessionHandshake.begin(clientId, owner, peerPublicKey, identity, now)
         send(output, pending.envelope.toString())
         val accepted = input.readJson(output, "session handshake relay acceptance")
         if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Session handshake rejected"))

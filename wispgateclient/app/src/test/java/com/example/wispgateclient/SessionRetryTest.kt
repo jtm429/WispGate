@@ -81,10 +81,10 @@ class SessionRetryTest {
     @Test
     fun authenticatedSessionResetIsRecoverableBeforeDecryption() {
         val reset = JSONObject().put("type", "session_reset")
-            .put("sender", "prime-wisp").put("recipient", "android-user")
+            .put("sender", "prime-wisp").put("recipient", "android-endpoint-uuid")
             .put("reason", "unknown_session")
 
-        val failure = runCatching { requirePeerApplicationFrame(reset, "prime-wisp") }.exceptionOrNull()
+        val failure = runCatching { requirePeerApplicationFrame(reset, "prime-wisp", "android-endpoint-uuid") }.exceptionOrNull()
 
         assertTrue(failure is PeerSessionFailure)
         assertEquals("Peer requested session reset: unknown_session", failure?.message)

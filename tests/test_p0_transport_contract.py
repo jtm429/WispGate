@@ -15,14 +15,13 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.x509.oid import NameOID
 
 from appserve.client import AppserveClient, ServerInfo
+from appserve.bootstrap import build_bootstrap_request, decrypt_bootstrap_response
 from appserve.e2e import generate_identity, public_key_text
 from server.appserve_server.core import (
     RelayConfig,
     RelayState,
-    build_bootstrap_request,
     decrypt_bootstrap_request,
     build_bootstrap_response,
-    decrypt_bootstrap_response,
 )
 from server.appserve_server.service import RelayRuntime, create_server_ssl_context
 

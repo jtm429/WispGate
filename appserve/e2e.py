@@ -79,6 +79,7 @@ class PeerSession:
         wisp_to_android_key: bytes,
         *,
         created_at: float,
+        android_side: bool,
     ) -> None:
         self.session_id = session_id
         self.local_id = local_id
@@ -86,9 +87,9 @@ class PeerSession:
         self.created_at = created_at
         self.send_sequence = 0
         self.receive_sequence = 0
-        android_side = local_id == "android-user"
-        self._send_key = android_to_wisp_key if android_side else wisp_to_android_key
-        self._receive_key = wisp_to_android_key if android_side else android_to_wisp_key
+        is_android_side = android_side
+        self._send_key = android_to_wisp_key if is_android_side else wisp_to_android_key
+        self._receive_key = wisp_to_android_key if is_android_side else android_to_wisp_key
 
     def _check_live(self, now: float) -> None:
         if now >= self.created_at + SESSION_LIFETIME_SECONDS:

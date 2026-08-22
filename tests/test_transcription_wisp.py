@@ -4,7 +4,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from appserve import UploadedFile, WispAction
+from appserve import UploadedFile, WispAction, WispContext
 from examples.transcription_wisp import (
     Diarizer,
     SherpaDiarizer,
@@ -50,7 +50,7 @@ def test_wisp_passes_same_complete_file_to_both_engines(tmp_path: Path) -> None:
     wisp = TranscriptionWisp(transcriber, diarizer)
     uploaded = UploadedFile("recording", "episode.wav", "audio/wav", source.stat().st_size, source)
 
-    result = asyncio.run(wisp.action(WispAction({"type": "process"}, {"recording": uploaded})))
+    result = asyncio.run(wisp.action(WispAction({"type": "process"}, {"recording": uploaded}), WispContext("test-peer")))
 
     assert "speaker_a" in result["html"]
     assert transcriber.paths == diarizer.paths == [str(source)]
@@ -65,7 +65,7 @@ def test_duplicate_processing_request_is_rejected_while_locked(tmp_path: Path) -
     async def scenario() -> None:
         await wisp._processing_lock.acquire()
         try:
-            result = await wisp.action(WispAction({"type": "process"}, {"recording": uploaded}))
+            result = await wisp.action(WispAction({"type": "process"}, {"recording": uploaded}), WispContext("test-peer"))
             assert "already being processed" in result["html"]
         finally:
             wisp._processing_lock.release()
@@ -87,7 +87,7 @@ def test_transcription_wisp_turns_into_empty_response_for_empty_models(tmp_path:
 
     wisp = TranscriptionWisp(EmptyTranscriber(), EmptyDiarizer())
     uploaded = UploadedFile("recording", "episode.wav", "audio/wav", source.stat().st_size, source)
-    result = asyncio.run(wisp.action(WispAction({"type": "process"}, {"recording": uploaded})))
+    result = asyncio.run(wisp.action(WispAction({"type": "process"}, {"recording": uploaded}), WispContext("test-peer")))
     assert "No speech turns found" in result["html"]
 
 

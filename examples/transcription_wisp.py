@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 # Support direct imports when this module is run from examples/.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from appserve import UploadedFile, Wisp, WispAction
+from appserve import UploadedFile, Wisp, WispAction, WispContext
 
 
 @dataclass(frozen=True)
@@ -171,7 +171,7 @@ class TranscriptionWisp:
         self._processing_lock = asyncio.Lock()
         self.current: dict[str, str] = render_form()
 
-    def state(self) -> dict[str, str]:
+    def state(self, context: WispContext) -> dict[str, str]:
         return self.current
 
     async def _process(self, recording: UploadedFile) -> dict[str, str]:
@@ -197,7 +197,7 @@ class TranscriptionWisp:
         self.log.info("merged response turns=%s", len(turns))
         return render_result(turns)
 
-    async def action(self, action: WispAction | dict[str, Any]) -> dict[str, str]:
+    async def action(self, action: WispAction | dict[str, Any], context: WispContext) -> dict[str, str]:
         if action.get("type") != "process":
             return self.current
         files = getattr(action, "files", {})

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,7 @@ def test_catalog_distributes_only_enrolled_endpoint_public_keys(tmp_path: Path) 
     relay.state.clients["prime-wisp"] = {"public_key": key}
     relay.state.wisps["prime"] = {"id": "prime", "name": "Prime", "description": "", "owner": "prime-wisp"}
     relay.sessions["prime-wisp"] = ("prime-wisp", RecordingWriter())  # type: ignore[assignment]
+    relay.relay_liveness["prime-wisp"] = time.monotonic()
     assert relay.catalog_items()[0]["public_key"] == key
     relay.state.clients["legacy"] = {"public_key": "legacy"}
     relay.state.wisps["legacy-wisp"] = {"id": "legacy-wisp", "owner": "legacy"}
@@ -64,6 +66,26 @@ def test_catalog_excludes_registered_wisp_without_live_session(tmp_path: Path) -
     assert relay.catalog_items() == []
 
 
+def test_catalog_broadcast_after_owner_becomes_live(tmp_path: Path) -> None:
+    relay = runtime(tmp_path)
+    owner_key = public_key_text(generate_identity())
+    relay.state.clients["bakaneko-pi-wisp"] = {"public_key": owner_key, "status": "approved"}
+    relay.state.wisps["bakaneko-desktop"] = {
+        "id": "bakaneko-desktop", "name": "Bakaneko", "description": "", "owner": "bakaneko-pi-wisp",
+    }
+    control = RecordingWriter()
+    relay.control_sessions["android-endpoint-uuid"] = ("android-endpoint-uuid", control)  # type: ignore[assignment]
+
+    assert relay.catalog_items() == []
+    relay.sessions["bakaneko-pi-wisp"] = ("bakaneko-pi-wisp", RecordingWriter())  # type: ignore[assignment]
+    relay.relay_liveness["bakaneko-pi-wisp"] = time.monotonic()
+    asyncio.run(relay.broadcast_catalog())
+
+    assert control.messages[0]["type"] == "catalog_update"
+    assert control.messages[0]["items"][0]["id"] == "bakaneko-desktop"
+    assert control.messages[0]["items"][0]["owner"] == "bakaneko-pi-wisp"
+
+
 def test_changed_enrolled_endpoint_key_fails_closed(tmp_path: Path) -> None:
     state = RelayState(tmp_path / "state.json")
     state.register_client("prime-wisp", "real-public-key")
@@ -72,7 +94,7 @@ def test_changed_enrolled_endpoint_key_fails_closed(tmp_path: Path) -> None:
     assert state.clients["prime-wisp"]["public_key"] == "real-public-key"
 
 
-def test_relay_routes_android_logical_sender_from_authenticated_android_endpoint(tmp_path: Path) -> None:
+def test_relay_rejects_logical_sender_even_for_android_endpoint(tmp_path: Path) -> None:
     relay = runtime(tmp_path)
     sender = RecordingWriter()
     recipient = RecordingWriter()
@@ -85,9 +107,8 @@ def test_relay_routes_android_logical_sender_from_authenticated_android_endpoint
         "ciphertext": "opaque-ciphertext-and-tag",
     }
     asyncio.run(relay.forward("android-endpoint-uuid", envelope))
-    assert sender.messages == [{"ok": True, "type": "accepted", "session_id": "s1", "sequence": 0}]
-    assert recipient.messages == [envelope]
-    assert "body" not in str(recipient.messages)
+    assert sender.messages == [{"ok": False, "error": "invalid_envelope"}]
+    assert recipient.messages == []
 
 
 def test_relay_rejects_android_logical_sender_from_non_android_endpoint(tmp_path: Path) -> None:

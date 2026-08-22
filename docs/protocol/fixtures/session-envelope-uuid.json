@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "type": "session_envelope",
+  "session_id": "fixture-session",
+  "sender": "android-endpoint-uuid",
+  "recipient": "prime-wisp",
+  "sequence": 0,
+  "ciphertext": "uuid-based-conformance-vector"
+}

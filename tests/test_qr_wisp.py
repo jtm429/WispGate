@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from appserve import WispResponse
+from appserve import WispContext, WispResponse
 from examples.qr_wisp import QrWisp
 
 
 def test_qr_wisp_turns_link_into_static_inline_png_then_resets() -> None:
     program = QrWisp()
 
-    initial = program.state()
-    generated = program.action({"type": "make_qr", "link": "https://example.com/path"})
+    context = WispContext("test-peer")
+    initial = program.state(context)
+    generated = program.action({"type": "make_qr", "link": "https://example.com/path"}, context)
 
     assert isinstance(initial, dict)
     assert "name=\"link\"" in initial["html"]
@@ -22,7 +23,7 @@ def test_qr_wisp_turns_link_into_static_inline_png_then_resets() -> None:
     assert "download" not in generated.html.lower()
     assert "Make another QR code" in generated.html
 
-    reset = program.action({"type": "make_another"})
+    reset = program.action({"type": "make_another"}, context)
 
     assert isinstance(reset, dict)
     assert "name=\"link\"" in reset["html"]
@@ -31,7 +32,7 @@ def test_qr_wisp_turns_link_into_static_inline_png_then_resets() -> None:
 def test_qr_wisp_reports_an_overlong_link_instead_of_crashing() -> None:
     program = QrWisp()
 
-    response = program.action({"type": "make_qr", "link": "https://example.com/" + "x" * 5000})
+    response = program.action({"type": "make_qr", "link": "https://example.com/" + "x" * 5000}, WispContext("test-peer"))
 
     assert isinstance(response, dict)
     assert "Link must be 2,048 characters or fewer." in response["html"]
@@ -40,7 +41,7 @@ def test_qr_wisp_reports_an_overlong_link_instead_of_crashing() -> None:
 def test_qr_wisp_reports_data_that_does_not_fit_a_qr_code() -> None:
     program = QrWisp()
 
-    response = program.action({"type": "make_qr", "link": "https://example.com/" + "😀" * 2000})
+    response = program.action({"type": "make_qr", "link": "https://example.com/" + "😀" * 2000}, WispContext("test-peer"))
 
     assert isinstance(response, dict)
     assert "This link contains too much data for a QR code." in response["html"]

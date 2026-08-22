@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import json
 from pathlib import Path
 
@@ -116,6 +117,28 @@ def test_management_state_includes_endpoint_controls(tmp_path: Path) -> None:
 
     assert "Approve" in admin["html"]
     assert "Revoke" in admin["html"]
+
+
+def test_management_does_not_render_self_destructive_admin_buttons(tmp_path: Path) -> None:
+    state = RelayState(tmp_path / "state.json")
+    runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=True), state)
+    admin_key = public_key_text(generate_identity())
+    pending_key = public_key_text(generate_identity())
+    state.enroll_client("admin", admin_key, client_kind="android")
+    state.enroll_client("pending", pending_key, client_kind="android")
+    state.claim_admin("admin")
+
+    rendered = runtime.management_request("admin", {"action": "state"})["html"]
+    decoded = html.unescape(rendered)
+
+    # Every rendered endpoint action must be actionable.  The handler rejects
+    # self-targeted changes, so those controls must not be offered for the
+    # administrator's own row.
+    assert '\\"action\\":\\"reject\\",\\"client_id\\":\\"admin\\"' not in decoded
+    assert '\\"action\\":\\"revoke\\",\\"client_id\\":\\"admin\\"' not in decoded
+    assert '\\"action\\":\\"approve\\",\\"client_id\\":\\"pending\\"' in decoded
+    assert '\\"action\\":\\"reject\\",\\"client_id\\":\\"pending\\"' in decoded
+    assert '\\"action\\":\\"revoke\\",\\"client_id\\":\\"pending\\"' in decoded
 
 
 def test_server_update_is_management_action_not_generic_control_action(tmp_path: Path) -> None:
