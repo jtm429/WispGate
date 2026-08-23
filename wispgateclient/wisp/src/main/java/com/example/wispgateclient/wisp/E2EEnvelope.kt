@@ -1,4 +1,4 @@
-package com.example.wispgateclient
+package com.example.wispgateclient.wisp
 
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream

@@ -20,5 +20,5 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "WispGateClient"
-include(":app")
+include(":app", ":wisp")
  

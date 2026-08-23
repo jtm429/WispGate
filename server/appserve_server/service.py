@@ -484,54 +484,46 @@ class RelayRuntime:
         connection: _BulkConnection | None = None
         try:
             header = json.loads(await asyncio.wait_for(reader.readline(), timeout=15))
-            client_id = await self._authenticate_endpoint(
-                reader, writer, header,
-                allowed_roles={"bulk_sender", "bulk_receiver"}, allow_enrollment=False,
-            )
-            if client_id is None:
-                return
-            ticket = header.get("ticket")
-            role = {"bulk_sender": "sender", "bulk_receiver": "receiver"}.get(header.get("role"))
-            peer = header.get("peer")
-            length = header.get("length")
             if (
-                header.get("type") != "auth_hello"
-                or not isinstance(ticket, str) or not 16 <= len(ticket) <= 256
-                or role not in {"sender", "receiver"}
-                or not isinstance(peer, str) or not peer or peer == client_id
-                or not isinstance(length, int) or isinstance(length, bool)
-                or not 16 <= length <= self.MAX_BULK_BYTES
+                header.get("type") != "bulk_connect"
+                or header.get("role") not in {"sender", "receiver"}
+                or not all(isinstance(header.get(key), str) and header.get(key) for key in ("session_id", "transfer_id", "sender", "recipient"))
+                or header.get("sender") == header.get("recipient")
+                or not isinstance(header.get("length"), int)
+                or isinstance(header.get("length"), bool)
+                or not 16 <= header["length"] <= self.MAX_BULK_BYTES
             ):
-                await send_json(writer, {"ok": False, "error": "invalid_bulk_offer"})
+                await send_json(writer, {"ok": False, "error": "invalid_bulk_connect"})
                 return
-            connection = _BulkConnection(client_id, peer, role, length, reader, writer)
+            key = f'{header["session_id"]}:{header["transfer_id"]}'
+            connection = _BulkConnection(
+                header["sender"], header["recipient"], header["role"], header["length"], reader, writer,
+            )
             async with self.bulk_lock:
                 now = time.monotonic()
                 self.consumed_bulk = {
-                    used_ticket: expires
-                    for used_ticket, expires in self.consumed_bulk.items()
-                    if expires > now
+                    used_ticket: expires for used_ticket, expires in self.consumed_bulk.items() if expires > now
                 }
-                if ticket in self.consumed_bulk:
-                    await send_json(writer, {"ok": False, "error": "bulk_ticket_used"})
+                if key in self.consumed_bulk:
+                    await send_json(writer, {"ok": False, "error": "bulk_transfer_used"})
                     return
-                waiting = self.pending_bulk.pop(ticket, None)
+                waiting = self.pending_bulk.pop(key, None)
                 if waiting is None:
                     if len(self.pending_bulk) >= self.MAX_PENDING_BULK:
                         await send_json(writer, {"ok": False, "error": "too_many_pending_bulk_offers"})
                         return
-                    self.pending_bulk[ticket] = connection
+                    self.pending_bulk[key] = connection
                 elif (
-                    waiting.role == role
-                    or waiting.client_id != peer
-                    or waiting.peer != client_id
-                    or waiting.length != length
+                    waiting.role == connection.role
+                    or waiting.client_id != connection.peer
+                    or waiting.peer != connection.client_id
+                    or waiting.length != connection.length
                 ):
-                    self.pending_bulk[ticket] = waiting
+                    self.pending_bulk[key] = waiting
                     await send_json(writer, {"ok": False, "error": "bulk_pair_mismatch"})
                     return
                 else:
-                    self.consumed_bulk[ticket] = now + self.BULK_TICKET_TTL_SECONDS
+                    self.consumed_bulk[key] = now + self.BULK_TICKET_TTL_SECONDS
                     sender = connection if connection.role == "sender" else waiting
                     receiver = connection if connection.role == "receiver" else waiting
                     task = asyncio.create_task(self._pipe_bulk(sender, receiver))
@@ -546,9 +538,9 @@ class RelayRuntime:
         finally:
             if connection is not None:
                 async with self.bulk_lock:
-                    for ticket, waiting in list(self.pending_bulk.items()):
+                    for key, waiting in list(self.pending_bulk.items()):
                         if waiting is connection:
-                            self.pending_bulk.pop(ticket, None)
+                            self.pending_bulk.pop(key, None)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -565,6 +557,7 @@ class RelayRuntime:
             timeout=self.BULK_IO_TIMEOUT_SECONDS,
         )
         await send_json(sender.writer, {"ok": True, "type": "bulk_complete"})
+        await send_json(receiver.writer, {"ok": True, "type": "bulk_complete"})
 
     @staticmethod
     async def _copy_bulk_ciphertext(sender: "_BulkConnection", receiver: "_BulkConnection") -> None:

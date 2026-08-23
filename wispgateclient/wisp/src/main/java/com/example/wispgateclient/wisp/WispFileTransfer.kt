@@ -1,4 +1,4 @@
-package com.example.wispgateclient
+package com.example.wispgateclient.wisp
 
 import org.json.JSONArray
 import org.json.JSONObject
@@ -33,7 +33,7 @@ internal object OperationProtocol {
     }
 }
 
-internal object StagedFileCache {
+object StagedFileCache {
     private const val DIRECTORY_NAME = "wispgate-file-actions"
     private val sweptThisProcess = AtomicBoolean(false)
 
@@ -190,9 +190,7 @@ object FileActionProtocol {
                     .put(
                         "bulk",
                         JSONObject()
-                            .put("algorithm", "RSA-OAEP-256+A256GCM")
-                            .put("ticket", upload.ticket)
-                            .put("encrypted_key", upload.encryptedKey)
+                            .put("algorithm", "SESSION-A256GCM-v2")
                             .put("nonce", upload.nonce)
                             .put("ciphertext_size", upload.ciphertextSize),
                     ),

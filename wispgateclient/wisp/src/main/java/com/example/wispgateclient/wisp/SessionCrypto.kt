@@ -1,4 +1,4 @@
-package com.example.wispgateclient
+package com.example.wispgateclient.wisp
 
 import org.json.JSONObject
 import java.io.IOException
@@ -39,12 +39,22 @@ suspend fun <T> recoverMutationOnce(
     invalidate: () -> Unit,
     start: suspend (String) -> T,
     resume: suspend (String) -> T,
-): T = try {
-    start(operationId)
-} catch (cause: Exception) {
-    if (cause !is RecoverableSessionFailure && cause !is IOException) throw cause
-    invalidate()
-    resume(operationId)
+): T {
+    try {
+        return start(operationId)
+    } catch (cause: Exception) {
+        if (cause !is RecoverableSessionFailure && cause !is IOException) throw cause
+        invalidate()
+        return try {
+            resume(operationId)
+        } catch (resumeCause: Exception) {
+            throw IllegalStateException(
+                "Initial operation failed: ${cause.message ?: cause::class.simpleName}; " +
+                    "resume failed: ${resumeCause.message ?: resumeCause::class.simpleName}",
+                resumeCause,
+            )
+        }
+    }
 }
 
 object SessionCrypto {
@@ -60,7 +70,7 @@ object SessionCrypto {
         )
     }
 
-    private fun hkdf(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
+    internal fun hkdf(ikm: ByteArray, salt: ByteArray, info: ByteArray): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(salt, "HmacSHA256"))
         val prk = mac.doFinal(ikm)
@@ -138,7 +148,13 @@ object SessionHandshake {
     fun finish(pending: Pending, envelope: JSONObject, nowMillis: Long): PeerSession {
         if (nowMillis >= pending.createdAtMillis + SessionCrypto.LIFETIME_MILLIS ||
             envelope.optString("sender") != pending.owner || envelope.optString("recipient") != pending.localId) {
-            throw SecurityException("Invalid session acceptance route or lifetime")
+            throw SecurityException(
+                "Invalid session acceptance route or lifetime: " +
+                    "expected=${pending.owner}->${pending.localId}, " +
+                    "received=${envelope.optString("sender")}->${envelope.optString("recipient")}, " +
+                    "type=${envelope.optString("type")}, ok=${envelope.optBoolean("ok")}, " +
+                    "ageMs=${nowMillis - pending.createdAtMillis}",
+            )
         }
         val body = E2EEnvelope.decrypt(envelope, pending.identity.private, pending.peerPublicKey).body
         if (body.optString("type") != "session_accept" || body.optString("session_id") != pending.sessionId ||
@@ -170,6 +186,12 @@ class PeerSession(
     }
 
     fun isExpired(nowMillis: Long): Boolean = nowMillis >= createdAtMillis + SessionCrypto.LIFETIME_MILLIS
+
+    fun bulkKey(transferId: String, sending: Boolean): ByteArray {
+        require(transferId.isNotEmpty())
+        val source = if (sending) sendKey else receiveKey
+        return SessionCrypto.hkdf(source, transferId.toByteArray(), "wispgate-bulk-v2".toByteArray())
+    }
 
     @Synchronized
     fun encrypt(body: JSONObject, nowMillis: Long): JSONObject {

@@ -1,5 +1,7 @@
 package com.example.wispgateclient
 
+import com.example.wispgateclient.wisp.*
+
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.Assert.assertEquals

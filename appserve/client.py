@@ -168,8 +168,7 @@ class _PreparedOutboundAsset:
     transfer_id: str
     sender: str
     recipient: str
-    ticket: str
-    encrypted_key: str
+    session_id: str
     nonce: str
     content_key: bytes
 
@@ -179,12 +178,12 @@ class _PreparedOutboundAsset:
 
     def aad(self) -> bytes:
         return b"\0".join([
-            b"wispgate-bulk-v1",
+            b"wispgate-bulk-v2",
+            self.session_id.encode(),
             self.sender.encode(),
             self.recipient.encode(),
             self.transfer_id.encode(),
             self.asset.id.encode(),
-            self.ticket.encode(),
             str(self.asset.size).encode(),
         ])
 
@@ -605,14 +604,10 @@ class AppserveClient:
                 bulk = manifest.get("bulk")
                 if not isinstance(bulk, dict):
                     raise ValueError("file manifest requires bulk transport metadata")
-                ticket = bulk.get("ticket")
-                encrypted_key = bulk.get("encrypted_key")
                 nonce = bulk.get("nonce")
                 ciphertext_size = bulk.get("ciphertext_size")
                 if (
-                    bulk.get("algorithm") != "RSA-OAEP-256+A256GCM"
-                    or not isinstance(ticket, str) or not 16 <= len(ticket) <= 256
-                    or not isinstance(encrypted_key, str) or not encrypted_key
+                    bulk.get("algorithm") != "SESSION-A256GCM-v2"
                     or not isinstance(nonce, str) or not nonce
                     or ciphertext_size != size + 16
                 ):
@@ -695,38 +690,34 @@ class AppserveClient:
     async def _receive_bulk_file(self, sender: str, transfer_id: str, incoming: _IncomingFile) -> None:
         assert incoming.bulk is not None
         bulk = incoming.bulk
-        encrypted_key = base64.urlsafe_b64decode(bulk["encrypted_key"] + "=" * (-len(bulk["encrypted_key"]) % 4))
         nonce = base64.urlsafe_b64decode(bulk["nonce"] + "=" * (-len(bulk["nonce"]) % 4))
         if len(nonce) != 12:
             raise ValueError("invalid bulk nonce")
-        file_key = self._identity_key.decrypt(
-            encrypted_key,
-            padding.OAEP(mgf=padding.MGF1(hashes.SHA1()), algorithm=hashes.SHA256(), label=None),
-        )
-        if len(file_key) != 32:
-            raise ValueError("invalid bulk content key")
+        session = self._peer_sessions.get(sender)
+        if session is None:
+            raise ValueError("no active peer session for bulk transfer")
+        file_key = session.bulk_key(transfer_id, sending=False)
         reader, writer = await self._open_tls(self.info.bulk_port)
         try:
             await self._send(writer, {
-                "type": "auth_hello",
-                "role": "bulk_receiver",
-                "client_id": self.client_id,
-                "public_key": public_key_text(self._identity_key),
-                "ticket": bulk["ticket"],
-                "peer": sender,
+                "type": "bulk_connect",
+                "role": "receiver",
+                "session_id": session.session_id,
+                "transfer_id": transfer_id,
+                "sender": self.client_id,
+                "recipient": sender,
                 "length": bulk["ciphertext_size"],
             })
-            await self._complete_auth(reader, writer, "bulk_receiver", bulk["ticket"], sender, bulk["ciphertext_size"])
             ready = await self._read(reader)
             if not ready.get("ok") or ready.get("type") != "bulk_ready":
                 raise ConnectionError(ready.get("error", "bulk relay rejected transfer"))
             aad = b"\0".join([
-                b"wispgate-bulk-v1",
+                b"wispgate-bulk-v2",
+                session.session_id.encode(),
                 sender.encode(),
                 self.client_id.encode(),
                 transfer_id.encode(),
                 incoming.id.encode(),
-                bulk["ticket"].encode(),
                 str(incoming.size).encode(),
             ])
             decryptor = Cipher(algorithms.AES(file_key), modes.GCM(nonce)).decryptor()
@@ -861,52 +852,41 @@ class AppserveClient:
             ):
                 raise ValueError("invalid Wisp response asset")
             ids.add(asset.id)
-        peer_text = self._peer_keys.get(recipient)
-        if not peer_text:
-            raise ValueError(f"no trusted public key for {recipient}")
-        peer_key = serialization.load_der_public_key(
-            base64.urlsafe_b64decode(peer_text + "=" * (-len(peer_text) % 4))
-        )
+        session = self._peer_sessions.get(recipient)
+        if session is None:
+            raise ValueError(f"no active peer session for {recipient}")
         transfer_id = secrets.token_urlsafe(18)
         prepared: list[_PreparedOutboundAsset] = []
         for asset in assets:
-            content_key = secrets.token_bytes(32)
             nonce = secrets.token_bytes(12)
-            ticket = secrets.token_urlsafe(24)
-            wrapped = peer_key.encrypt(
-                content_key,
-                padding.OAEP(mgf=padding.MGF1(hashes.SHA1()), algorithm=hashes.SHA256(), label=None),
-            )
             prepared.append(
                 _PreparedOutboundAsset(
                     asset,
                     transfer_id,
                     self.client_id,
                     recipient,
-                    ticket,
-                    base64.urlsafe_b64encode(wrapped).decode().rstrip("="),
+                    session.session_id,
                     base64.urlsafe_b64encode(nonce).decode().rstrip("="),
-                    content_key,
+                    session.bulk_key(transfer_id, sending=True),
                 )
             )
         return prepared
 
     async def _send_outbound_asset(self, item: _PreparedOutboundAsset) -> None:
+        session = self._peer_sessions.get(item.recipient)
+        if session is None:
+            raise ValueError("no active peer session for bulk transfer")
         reader, writer = await self._open_tls(self.info.bulk_port)
         try:
-            await self._send(
-                writer,
-                {
-                    "type": "auth_hello",
-                    "role": "bulk_sender",
-                    "client_id": self.client_id,
-                    "public_key": public_key_text(self._identity_key),
-                    "ticket": item.ticket,
-                    "peer": item.recipient,
-                    "length": item.ciphertext_size,
-                },
-            )
-            await self._complete_auth(reader, writer, "bulk_sender", item.ticket, item.recipient, item.ciphertext_size)
+            await self._send(writer, {
+                "type": "bulk_connect",
+                "role": "sender",
+                "session_id": session.session_id,
+                "transfer_id": item.transfer_id,
+                "sender": self.client_id,
+                "recipient": item.recipient,
+                "length": item.ciphertext_size,
+            })
             ready = await self._read(reader)
             if not ready.get("ok") or ready.get("type") != "bulk_ready":
                 raise ConnectionError(ready.get("error", "bulk relay rejected transfer"))
@@ -1085,7 +1065,16 @@ class AppserveClient:
 
     @staticmethod
     async def _read(reader: asyncio.StreamReader) -> dict[str, Any]:
-        return json.loads(await reader.readline())
+        line = await reader.readline()
+        if not line:
+            raise ConnectionError("WispGate peer closed the connection before sending a JSON frame")
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as cause:
+            raise ConnectionError("WispGate peer sent an invalid JSON frame") from cause
+        if not isinstance(value, dict):
+            raise ConnectionError("WispGate peer sent a non-object JSON frame")
+        return value
 
 
 def load(path: str | Path, *, reset_peer_trust: bool = False) -> AppserveClient:

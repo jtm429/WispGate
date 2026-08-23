@@ -1,5 +1,7 @@
 package com.example.wispgateclient
 
+import com.example.wispgateclient.wisp.*
+
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service

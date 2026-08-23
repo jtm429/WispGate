@@ -1,5 +1,7 @@
 package com.example.wispgateclient
 
+import com.example.wispgateclient.wisp.*
+
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

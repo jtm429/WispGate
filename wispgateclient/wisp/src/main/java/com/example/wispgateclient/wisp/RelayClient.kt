@@ -1,4 +1,4 @@
-package com.example.wispgateclient
+package com.example.wispgateclient.wisp
 
 import android.content.Context
 import android.os.SystemClock
@@ -316,9 +316,10 @@ class RelayClient(private val context: Context) {
                         val prepared = BulkFileCrypto.prepare(
                             sender = clientId,
                             recipient = wisp.owner,
+                            sessionId = peerSession.sessionId,
+                            sessionKey = peerSession.bulkKey(action.transferId, sending = true),
                             transferId = action.transferId,
                             files = action.files,
-                            recipientPublicKey = peerKey,
                         )
                         val begun = exchangeSessionFrame(
                             input, output, peerSession, FileActionProtocol.begin(wisp.id, action, prepared),
@@ -336,8 +337,6 @@ class RelayClient(private val context: Context) {
                                 port = info.bulkPort,
                                 recipient = wisp.owner,
                                 tlsCertSha256 = tlsAnchor(),
-                                clientId = clientId,
-                                identity = identity,
                                 upload = upload,
                             )
                             Log.i("WispFileTransfer", "bulk file sent id=${upload.file.id} bytes=${upload.file.size}")
@@ -390,10 +389,9 @@ class RelayClient(private val context: Context) {
                     sender = wisp.owner,
                     recipient = clientId,
                     tlsCertSha256 = tlsAnchor(),
-                    clientId = clientId,
-                    identity = identity,
+                    sessionId = peerSession.sessionId,
+                    sessionKey = peerSession.bulkKey(parsed.transferId, sending = false),
                     offer = offer,
-                    privateKey = identity.private,
                     directory = directory,
                 )
                 asset.id to asset
@@ -469,9 +467,22 @@ class RelayClient(private val context: Context) {
         send(output, pending.envelope.toString())
         val accepted = input.readJson(output, "session handshake relay acceptance")
         if (!accepted.optBoolean("ok")) error(accepted.optString("error", "Session handshake rejected"))
-        val acceptance = input.readJson(output, "authenticated Wisp session acceptance")
+        val acceptance = readSessionAcceptance(input, output)
         return SessionHandshake.finish(pending, acceptance, SystemClock.elapsedRealtime()).also {
             RelayOperationCoordinator.peerSessions[cacheKey] = it
+        }
+    }
+
+    private fun readSessionAcceptance(input: BufferedReader, output: BufferedWriter): JSONObject {
+        while (true) {
+            val frame = input.readJson(output, "authenticated Wisp session acceptance")
+            if (frame.optString("type") == "accepted") {
+                if (!frame.optBoolean("ok")) {
+                    error(frame.optString("error", "Session handshake rejected"))
+                }
+                continue
+            }
+            return frame
         }
     }
 
@@ -535,7 +546,7 @@ class RelayClient(private val context: Context) {
     private fun Socket.writer() = BufferedWriter(OutputStreamWriter(getOutputStream()))
 }
 
-internal class WispStateOwner {
+class WispStateOwner {
     private var current: RelayClient.WispState? = null
 
     fun replace(next: RelayClient.WispState?) {

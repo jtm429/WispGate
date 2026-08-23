@@ -1,5 +1,7 @@
 package com.example.wispgateclient
 
+import com.example.wispgateclient.wisp.*
+
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri

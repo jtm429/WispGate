@@ -95,6 +95,14 @@ class PeerSession:
         if now >= self.created_at + SESSION_LIFETIME_SECONDS:
             raise ValueError("session expired")
 
+    def bulk_key(self, transfer_id: str, *, sending: bool) -> bytes:
+        if not isinstance(transfer_id, str) or not transfer_id:
+            raise ValueError("bulk transfer id is required")
+        return HKDF(
+            algorithm=hashes.SHA256(), length=32, salt=transfer_id.encode("utf-8"),
+            info=b"wispgate-bulk-v2",
+        ).derive(self._send_key if sending else self._receive_key)
+
     def encrypt(self, body: dict[str, Any], *, now: float) -> dict[str, Any]:
         self._check_live(now)
         sequence = self.send_sequence
