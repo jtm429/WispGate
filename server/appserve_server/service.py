@@ -663,6 +663,7 @@ class RelayRuntime:
             # Send this first so a fast Wisp response cannot race it.
             if source:
                 if envelope.get("type") == "session_envelope":
+                    LOG.info("session accepted sender=%s recipient=%s session=%s sequence=%s", sender, recipient, envelope.get("session_id"), envelope.get("sequence"))
                     await send_json(source[1], {
                         "ok": True, "type": "accepted", "session_id": envelope.get("session_id"),
                         "sequence": envelope.get("sequence"),
@@ -672,6 +673,7 @@ class RelayRuntime:
                 else:
                     await send_json(source[1], {"ok": True, "type": "accepted", "message_id": envelope.get("message_id")})
             try:
+                LOG.info("session forwarding sender=%s recipient=%s session=%s sequence=%s", sender, recipient, envelope.get("session_id"), envelope.get("sequence"))
                 await send_json(destination[1], envelope)
             except (ConnectionError, OSError) as exc:
                 LOG.info("relay destination disconnected while forwarding %s -> %s: %s", sender, recipient, exc)
@@ -685,6 +687,7 @@ class RelayRuntime:
                 except (ConnectionError, OSError):
                     pass
         else:
+            LOG.warning("session recipient offline sender=%s recipient=%s type=%s session=%s", sender, recipient, envelope.get("type"), envelope.get("session_id"))
             if source:
                 await send_json(source[1], {"ok": False, "error": "recipient_offline"})
 

@@ -433,8 +433,10 @@ class RelayClient(private val context: Context) {
         val accepted = try {
             input.readJson(output, "relay response")
         } catch (cause: Exception) {
+            Log.e("WispFileTransfer", "relay acceptance read failed stage=$responseStage: ${cause::class.simpleName}: ${cause.message}", cause)
             throw PeerSessionFailure("Relay closed while accepting peer-session frame", cause)
         }
+        Log.i("WispFileTransfer", "relay acceptance received stage=$responseStage ok=${accepted.optBoolean("ok")} type=${accepted.optString("type")} keys=${accepted.keys().asSequence().toList()}")
         if (!accepted.optBoolean("ok")) error(accepted.optString("error", rejectionMessage))
         return readSessionResponse(input, output, session, responseStage)
     }
@@ -446,9 +448,13 @@ class RelayClient(private val context: Context) {
         stage: String,
     ): JSONObject =
         try {
+            Log.i("WispFileTransfer", "waiting encrypted response stage=$stage session=${session.sessionId}")
             val frame = requirePeerApplicationFrame(input.readJson(output, stage), session.peerId, clientId)
-            session.decrypt(frame, SystemClock.elapsedRealtime())
+            val body = session.decrypt(frame, SystemClock.elapsedRealtime())
+            Log.i("WispFileTransfer", "encrypted response received stage=$stage session=${session.sessionId} keys=${body.keys().asSequence().toList()}")
+            body
         } catch (cause: Exception) {
+            Log.e("WispFileTransfer", "encrypted response read failed stage=$stage session=${session.sessionId}: ${cause::class.simpleName}: ${cause.message}", cause)
             throw PeerSessionFailure("Peer session failed while waiting for $stage", cause)
         }
 
