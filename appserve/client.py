@@ -263,8 +263,7 @@ class AppserveClient:
         self._reader, self._writer = reader, writer
         try:
             await self._authenticate_endpoint(writer, reader, "control")
-            bootstrap = self._bootstrap_payload()
-            await self._send(writer, {"type": "join", "payload": bootstrap})
+            await self._send(writer, {"type": "join", "client_id": self.client_id})
             joined = await self._read(reader)
             if not joined.get("ok"):
                 raise ConnectionError(joined.get("error", "join failed"))
