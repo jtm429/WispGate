@@ -274,7 +274,10 @@ class AppserveClient:
             LOG.info("Wisp registration accepted client=%s ids=%s", self.client_id, registered_ids)
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=5)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                LOG.debug("control TLS writer did not finish closing before timeout")
             self._reader = self._writer = None
 
         reader, writer = await self._open_tls(self.info.relay_port)
