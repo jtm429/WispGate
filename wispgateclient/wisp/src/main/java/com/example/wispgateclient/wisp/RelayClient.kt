@@ -297,6 +297,7 @@ class RelayClient(private val context: Context) {
                     authenticateEndpoint(input, output, AuthRole.RELAY, clientId)
                     val peerKey = trustedPeerKey(wisp.owner, wisp.publicKey)
                     val peerSession = sessionFor(wisp.owner, peerKey, input, output)
+                    Log.i("WispFileTransfer", "peer session ready operation=$operationId session=${peerSession.sessionId} peer=${peerSession.peerId} reconnecting=$reconnecting")
                     var completed: JSONObject? = null
                     if (reconnecting) {
                         val resumed = exchangeSessionFrame(
@@ -325,6 +326,7 @@ class RelayClient(private val context: Context) {
                             input, output, peerSession, FileActionProtocol.begin(wisp.id, action, prepared),
                             "File action rejected", "encrypted Wisp response",
                         )
+                        Log.i("WispFileTransfer", "file_begin response operation=$operationId keys=${begun.keys().asSequence().toList()} transfer=${begun.optJSONObject("transfer")?.toString() ?: "missing"}")
                         val transferReady = begun.optJSONObject("transfer") ?: error("Wisp did not accept the file action")
                         if (transferReady.optString("type") == "error") error(transferReady.optString("error", "File action rejected"))
                         if (transferReady.optString("type") != "ready" || transferReady.optString("transfer_id") != action.transferId) {

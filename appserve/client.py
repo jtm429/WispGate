@@ -487,6 +487,7 @@ class AppserveClient:
             state = await _invoke_wisp_callback(wisp.state, context=WispContext(sender))
         elif action_kind == "file_begin":
             transfer_id = str(body.get("transfer_id", ""))
+            LOG.info("file_begin received sender=%s wisp=%s transfer=%s files=%s", sender, wisp.id, transfer_id, len(body.get("files", [])) if isinstance(body.get("files"), list) else "invalid")
             completed = self._completed_operations.get((sender, transfer_id))
             if completed is not None:
                 await self._send_session(sender, completed[1])
@@ -507,8 +508,10 @@ class AppserveClient:
                     "transfer_id": transfer_id,
                     "error": str(cause),
                 })
+            LOG.info("file_begin response sender=%s wisp=%s transfer=%s response_type=%s response_error=%s", sender, wisp.id, transfer_id, response.get("transfer", {}).get("type"), response.get("transfer", {}).get("error"))
             await self._send_session(sender, response)
             transfer = self._transfers.get((sender, transfer_id))
+            LOG.info("file_begin transfer state sender=%s transfer=%s accepted=%s", sender, transfer_id, transfer is not None)
             if transfer is not None:
                 transfer.task = asyncio.create_task(self._receive_bulk_transfer(transfer_id, transfer))
             return
@@ -620,6 +623,7 @@ class AppserveClient:
             raise
 
         self._transfers[key] = _IncomingTransfer(sender, wisp, dict(action_data), directory, files, time.monotonic())
+        LOG.info("file_begin accepted sender=%s wisp=%s transfer=%s files=%s total_bytes=%s", sender, wisp.id, transfer_id, len(files), total)
         return self._transfer_response(wisp, {
             "type": "ready",
             "transfer_id": transfer_id,
@@ -627,6 +631,7 @@ class AppserveClient:
 
     async def _receive_bulk_transfer(self, transfer_id: str, transfer: _IncomingTransfer) -> None:
         key = (transfer.sender, transfer_id)
+        LOG.info("bulk transfer worker started sender=%s transfer=%s files=%s", transfer.sender, transfer_id, len(transfer.files))
         try:
             try:
                 for incoming in transfer.files.values():
@@ -697,8 +702,10 @@ class AppserveClient:
         if session is None:
             raise ValueError("no active peer session for bulk transfer")
         file_key = session.bulk_key(transfer_id, sending=False)
+        LOG.info("bulk receiver preparing sender=%s transfer=%s file=%s ciphertext=%s session=%s", sender, transfer_id, incoming.id, bulk["ciphertext_size"], session.session_id)
         reader, writer = await self._open_tls(self.info.bulk_port)
         try:
+            LOG.info("bulk receiver connecting sender=%s transfer=%s session=%s", sender, transfer_id, session.session_id)
             await self._send(writer, {
                 "type": "bulk_connect",
                 "role": "receiver",
@@ -709,6 +716,7 @@ class AppserveClient:
                 "length": bulk["ciphertext_size"],
             })
             ready = await self._read(reader)
+            LOG.info("bulk receiver readiness sender=%s transfer=%s ok=%s type=%s error=%s", sender, transfer_id, ready.get("ok"), ready.get("type"), ready.get("error"))
             if not ready.get("ok") or ready.get("type") != "bulk_ready":
                 raise ConnectionError(ready.get("error", "bulk relay rejected transfer"))
             aad = b"\0".join([

@@ -146,12 +146,15 @@ class BulkTransferService : Service() {
                 .build(),
         )
         val transferId = intent?.getStringExtra(EXTRA_TRANSFER_ID)
+        Log.i("WispFileTransfer", "service start startId=$startId transfer=$transferId hasIntent=${intent != null}")
         val job = transferId?.let(BulkTransferJobs::take)
         if (job == null) {
+            Log.e("WispFileTransfer", "service job missing transfer=$transferId")
             if (!ownership.hasActiveTransfers()) stopSelf(startId)
             return START_NOT_STICKY
         }
         ownership.started(job.action.transferId, startId)
+        Log.i("WispFileTransfer", "service job accepted transfer=${job.action.transferId} files=${job.action.files.size} wisp=${job.wisp.id}")
         scope.launch {
             val wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
                 .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WispGate:BulkTransfer")

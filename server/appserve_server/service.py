@@ -518,12 +518,14 @@ class RelayRuntime:
                         await send_json(writer, {"ok": False, "error": "too_many_pending_bulk_offers"})
                         return
                     self.pending_bulk[key] = connection
+                    LOG.info("bulk pending key=%s role=%s sender=%s recipient=%s pending_count=%s", key, connection.role, connection.client_id, connection.peer, len(self.pending_bulk))
                 elif (
                     waiting.role == connection.role
                     or waiting.client_id != connection.peer
                     or waiting.peer != connection.client_id
                     or waiting.length != connection.length
                 ):
+                    LOG.warning("bulk pair mismatch key=%s waiting=%s/%s/%s/%s incoming=%s/%s/%s/%s", key, waiting.role, waiting.client_id, waiting.peer, waiting.length, connection.role, connection.client_id, connection.peer, connection.length)
                     self.pending_bulk[key] = waiting
                     await send_json(writer, {"ok": False, "error": "bulk_pair_mismatch"})
                     return
@@ -534,13 +536,16 @@ class RelayRuntime:
                     task = asyncio.create_task(self._pipe_bulk(sender, receiver))
                     connection.task = task
                     waiting.task = task
+                    LOG.info("bulk paired key=%s sender=%s receiver=%s", key, sender.client_id, receiver.client_id)
             if connection.task is None:
+                LOG.info("bulk waiting key=%s role=%s timeout_seconds=30", key, connection.role)
                 await asyncio.wait_for(connection.paired.wait(), timeout=30)
             assert connection.task is not None
             await connection.task
-        except (asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError, json.JSONDecodeError, OSError):
-            pass
+        except (asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError, json.JSONDecodeError, OSError) as exc:
+            LOG.warning("bulk connection ended role=%s key=%s error=%s", connection.role if connection else None, key if connection else None, exc)
         finally:
+            LOG.info("bulk connection closing role=%s key=%s", connection.role if connection else None, key if connection else None)
             if connection is not None:
                 async with self.bulk_lock:
                     for key, waiting in list(self.pending_bulk.items()):
@@ -557,12 +562,14 @@ class RelayRuntime:
         receiver.paired.set()
         await send_json(sender.writer, {"ok": True, "type": "bulk_ready"})
         await send_json(receiver.writer, {"ok": True, "type": "bulk_ready"})
+        LOG.info("bulk_ready sent sender=%s receiver=%s", sender.client_id, receiver.client_id)
         await asyncio.wait_for(
             self._copy_bulk_ciphertext(sender, receiver),
             timeout=self.BULK_IO_TIMEOUT_SECONDS,
         )
         await send_json(sender.writer, {"ok": True, "type": "bulk_complete"})
         await send_json(receiver.writer, {"ok": True, "type": "bulk_complete"})
+        LOG.info("bulk_complete sent sender=%s receiver=%s", sender.client_id, receiver.client_id)
 
     @staticmethod
     async def _copy_bulk_ciphertext(sender: "_BulkConnection", receiver: "_BulkConnection") -> None:
