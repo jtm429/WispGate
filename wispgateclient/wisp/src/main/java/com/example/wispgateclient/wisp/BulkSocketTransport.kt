@@ -1,5 +1,6 @@
 package com.example.wispgateclient.wisp
 
+import android.util.Log
 import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
@@ -67,6 +68,7 @@ object BulkSocketTransport {
 
     fun send(host: String, port: Int, recipient: String, tlsCertSha256: String, upload: PreparedBulkUpload,
              connect: (String, Int, String) -> Socket = { target, targetPort, pin -> RelayTls.connect(target, targetPort, pin) }) {
+        Log.i("WispFileTransfer", "bulk sender connecting transfer=${upload.transferId} session=${upload.sessionId} sender=${upload.sender} recipient=$recipient length=${upload.ciphertextSize}")
         connect(host, port, tlsCertSha256).use { socket ->
             enableTcpKeepAlive(socket); socket.soTimeout = TRANSFER_TIMEOUT_MILLIS
             val input = socket.getInputStream(); val output = OutputStreamWriter(socket.getOutputStream()).buffered()
@@ -75,6 +77,7 @@ object BulkSocketTransport {
             val written = upload.encryptTo(socket.getOutputStream()); socket.getOutputStream().flush()
             require(written == upload.ciphertextSize) { "Bulk ciphertext length mismatch" }
             requireComplete(input)
+            Log.i("WispFileTransfer", "bulk sender complete transfer=${upload.transferId} session=${upload.sessionId}")
         }
     }
 

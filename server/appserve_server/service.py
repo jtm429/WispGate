@@ -496,6 +496,11 @@ class RelayRuntime:
                 await send_json(writer, {"ok": False, "error": "invalid_bulk_connect"})
                 return
             key = f'{header["session_id"]}:{header["transfer_id"]}'
+            LOG.info(
+                "bulk_connect role=%s session_id=%s transfer_id=%s sender=%s recipient=%s length=%s",
+                header["role"], header["session_id"], header["transfer_id"],
+                header["sender"], header["recipient"], header["length"],
+            )
             connection = _BulkConnection(
                 header["sender"], header["recipient"], header["role"], header["length"], reader, writer,
             )
