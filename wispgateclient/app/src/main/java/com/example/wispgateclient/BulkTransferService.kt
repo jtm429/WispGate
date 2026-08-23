@@ -10,9 +10,11 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import java.util.concurrent.ConcurrentHashMap
+
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -164,6 +166,7 @@ class BulkTransferService : Service() {
                 }
                 publishResult(BulkTransferResult(job.action.transferId, job.wisp.id, state = state))
             } catch (cause: Throwable) {
+                Log.e("WispFileTransfer", "transfer failed id=${job.action.transferId}: ${cause::class.java.simpleName}: ${cause.message}", cause)
                 publishResult(
                     BulkTransferResult(
                         job.action.transferId,
@@ -179,6 +182,7 @@ class BulkTransferService : Service() {
     }
 
     override fun onDestroy() {
+
         scope.cancel()
         super.onDestroy()
     }
