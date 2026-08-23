@@ -185,5 +185,15 @@ object EndpointAuthenticator {
             }
             throw SecurityException(error)
         }
+        // The relay listener emits a second, post-authentication `ready` frame.
+        // Consume it here so the first application operation cannot mistake it
+        // for the relay acceptance of its session envelope. Control auth has no
+        // such frame, and bulk sockets do not use endpoint authentication.
+        if (role == AuthRole.RELAY) {
+            val ready = readFrame()
+            if (!ready.optBoolean("ok") || ready.optString("type") != "ready") {
+                throw IOException("Relay did not issue its ready frame")
+            }
+        }
     }
 }
