@@ -946,7 +946,9 @@ class AppserveClient:
                 session = self._peer_sessions.get(recipient)
                 if session is None:
                     raise ValueError(f"no active session for {recipient}")
-                await self._send(writer, session.encrypt(body, now=time.monotonic()))
+                envelope = session.encrypt(body, now=time.monotonic())
+                LOG.info("session response sender=%s recipient=%s session=%s sequence=%s body_type=%s", envelope.get("sender"), envelope.get("recipient"), envelope.get("session_id"), envelope.get("sequence"), body.get("type"))
+                await self._send(writer, envelope)
                 return
 
     def _bootstrap_payload(self) -> str:

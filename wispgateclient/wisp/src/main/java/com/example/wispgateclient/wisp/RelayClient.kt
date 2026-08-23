@@ -448,8 +448,10 @@ class RelayClient(private val context: Context) {
         stage: String,
     ): JSONObject =
         try {
-            Log.i("WispFileTransfer", "waiting encrypted response stage=$stage session=${session.sessionId}")
-            val frame = requirePeerApplicationFrame(input.readJson(output, stage), session.peerId, clientId)
+            Log.i("WispFileTransfer", "waiting encrypted response stage=$stage session=${session.sessionId} expectedSender=${session.peerId} expectedRecipient=$clientId")
+            val raw = input.readJson(output, stage)
+            Log.i("WispFileTransfer", "encrypted frame received stage=$stage version=${raw.optInt("version")} type=${raw.optString("type")} sender=${raw.optString("sender")} recipient=${raw.optString("recipient")} session=${raw.optString("session_id")} sequence=${raw.optLong("sequence", -1)}")
+            val frame = requirePeerApplicationFrame(raw, session.peerId, clientId)
             val body = session.decrypt(frame, SystemClock.elapsedRealtime())
             Log.i("WispFileTransfer", "encrypted response received stage=$stage session=${session.sessionId} keys=${body.keys().asSequence().toList()}")
             body
