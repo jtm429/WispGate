@@ -214,6 +214,9 @@ class RelayClient(private val context: Context) {
             val result = withContext(Dispatchers.IO) {
                 managementRequest(info, request)
             }
+            if (result.optBoolean("ok") && result.has("html")) {
+                return@serialized WispState(MANAGEMENT_WISP_ID, result.optString("html"))
+            }
             return@serialized requestManagementState(
                 info,
                 result.takeUnless { it.optBoolean("ok") }?.optString("error"),

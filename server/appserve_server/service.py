@@ -135,6 +135,8 @@ class RelayRuntime:
             return {"ok": False, "error": "management_unauthorized"}
         if action == "current_server_version":
             return {"ok": True, "type": "server_version", "version": self.server_version}
+        if action == "download_logs":
+            return {"ok": True, "type": "server_logs", "html": self._management_logs_html()}
         if action == "update_server":
             if not self.update_command:
                 LOG.error("server update requested but no update command is configured")
@@ -185,6 +187,37 @@ class RelayRuntime:
             return {"ok": True, "id": wisp_id}
         return {"ok": False, "error": "unknown_management_action"}
 
+    def _management_logs_html(self) -> str:
+        max_bytes = 256 * 1024
+        sections: list[str] = []
+        update_path = Path("/var/lib/wispgate/update.log")
+        try:
+            sections.append("=== /var/lib/wispgate/update.log ===\n" + update_path.read_text(errors="replace")[-max_bytes:])
+        except OSError as cause:
+            sections.append(f"=== /var/lib/wispgate/update.log unavailable: {cause} ===")
+        try:
+            journal = subprocess.run(
+                ["journalctl", "-u", "wispgate-relay.service", "--no-pager", "-n", "500", "-o", "short-iso"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
+            content = journal.stdout or journal.stderr or "(no journal output)"
+            sections.append("=== journalctl -u wispgate-relay.service ===\n" + content[-max_bytes:])
+        except (OSError, subprocess.TimeoutExpired) as cause:
+            sections.append(f"=== relay journal unavailable: {cause} ===")
+        logs = "\n\n".join(sections)[-max_bytes:]
+        encoded = base64.b64encode(logs.encode("utf-8", "replace")).decode("ascii")
+        return (
+            "<main><h1>Server logs</h1>"
+            "<p>Bounded diagnostic capture; secrets and private keys are not included by this action.</p>"
+            f'<p><a download="wispgate-server-logs.txt" href="data:text/plain;base64,{encoded}">Download server logs</a></p>'
+            f"<details open><summary>Preview</summary><pre>{html.escape(logs)}</pre></details>"
+            "</main>"
+        )
+
     def _management_html(self, record: dict[str, Any], endpoints: list[dict[str, Any]], wisps: list[dict[str, Any]], *, admin: bool) -> str:
         esc = html.escape
 
@@ -204,6 +237,8 @@ class RelayRuntime:
                 + button({"action": "current_server_version"}, "Current server version")
                 + " "
                 + button({"action": "update_server"}, "Update server")
+                + " "
+                + button({"action": "download_logs"}, "Download server logs")
                 + "</p>"
             )
             out.append("<h2>Endpoints</h2><ul>")

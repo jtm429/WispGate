@@ -87,6 +87,26 @@ def test_management_state_is_server_owned_and_has_role_specific_controls(tmp_pat
     assert "Claim Administrator" not in admin["html"]
 
 
+def test_management_log_download_is_admin_only_and_bounded(tmp_path: Path) -> None:
+    state = RelayState(tmp_path / "state.json")
+    runtime = RelayRuntime(RelayConfig(b"", enrollment_enabled=True), state)
+    admin_key = public_key_text(generate_identity())
+    pending_key = public_key_text(generate_identity())
+    state.enroll_client("admin", admin_key, client_kind="android")
+    state.enroll_client("pending", pending_key, client_kind="android")
+    state.claim_admin("admin")
+
+    assert runtime.management_request("pending", {"action": "download_logs"}) == {
+        "ok": False,
+        "error": "management_unauthorized",
+    }
+    result = runtime.management_request("admin", {"action": "download_logs"})
+    assert result["ok"] is True
+    assert result["type"] == "server_logs"
+    assert "Download server logs" in result["html"]
+    assert "data:text/plain;base64," in result["html"]
+
+
 def test_current_server_version_is_management_action(tmp_path: Path) -> None:
     state = RelayState(tmp_path / "state.json")
     runtime = RelayRuntime(
