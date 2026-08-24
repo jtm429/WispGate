@@ -55,7 +55,7 @@ def test_catalog_distributes_only_enrolled_endpoint_public_keys(tmp_path: Path) 
     assert all(item["owner"] != "legacy" for item in relay.catalog_items())
 
 
-def test_catalog_keeps_registered_wisp_with_explicit_offline_status(tmp_path: Path) -> None:
+def test_catalog_excludes_registered_wisp_without_live_session(tmp_path: Path) -> None:
     relay = runtime(tmp_path)
     key = public_key_text(generate_identity())
     relay.state.clients["stopped-wisp"] = {"public_key": key, "status": "approved"}
@@ -63,10 +63,7 @@ def test_catalog_keeps_registered_wisp_with_explicit_offline_status(tmp_path: Pa
         "id": "stopped", "name": "Stopped", "description": "", "owner": "stopped-wisp",
     }
 
-    assert relay.catalog_items() == [{
-        "id": "stopped", "name": "Stopped", "description": "", "owner": "stopped-wisp",
-        "public_key": key, "online": False,
-    }]
+    assert relay.catalog_items() == []
 
 
 def test_catalog_broadcast_after_owner_becomes_live(tmp_path: Path) -> None:
@@ -79,8 +76,7 @@ def test_catalog_broadcast_after_owner_becomes_live(tmp_path: Path) -> None:
     control = RecordingWriter()
     relay.control_sessions["android-endpoint-uuid"] = ("android-endpoint-uuid", control)  # type: ignore[assignment]
 
-    assert relay.catalog_items()[0]["id"] == "bakaneko-desktop"
-    assert relay.catalog_items()[0]["online"] is False
+    assert relay.catalog_items() == []
     relay.sessions["bakaneko-pi-wisp"] = ("bakaneko-pi-wisp", RecordingWriter())  # type: ignore[assignment]
     relay.relay_liveness["bakaneko-pi-wisp"] = time.monotonic()
     asyncio.run(relay.broadcast_catalog())
@@ -88,7 +84,6 @@ def test_catalog_broadcast_after_owner_becomes_live(tmp_path: Path) -> None:
     assert control.messages[0]["type"] == "catalog_update"
     assert control.messages[0]["items"][0]["id"] == "bakaneko-desktop"
     assert control.messages[0]["items"][0]["owner"] == "bakaneko-pi-wisp"
-    assert control.messages[0]["items"][0]["online"] is True
 
 
 def test_changed_enrolled_endpoint_key_fails_closed(tmp_path: Path) -> None:

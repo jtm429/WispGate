@@ -70,19 +70,20 @@ class RelayRuntime:
             items.append({"id": "management", "name": "Management", "description": "Claim administrator access and manage server Wisps", "owner": "__server__", "public_key": self.config.public_key_text()})
         for manifest in self.state.wisps.values():
             owner = manifest.get("owner")
-            # Registration is durable identity/discovery state.  Do not make
-            # the Wisp disappear merely because its transient relay session is
-            # not currently live; callers need its stable owner and public key
-            # in order to report an explicit recipient_offline error and to
-            # recover automatically when the relay returns.
-            if not owner or not self._endpoint_usable(owner):
+            # ``state.wisps`` is durable registration metadata, not an online
+            # presence list.  Only advertise a Wisp while its runtime has a
+            # live relay session; otherwise clients retain dead/stale Wisps
+            # after an endpoint has stopped or before it has connected.
+            if not owner or not self._relay_online(owner):
                 continue
             if client_id and not self._endpoint_usable(client_id):
+                continue
+            if owner and not self._endpoint_usable(owner):
                 continue
             public_key = self.state.clients.get(owner, {}).get("public_key")
             if not public_key or not valid_endpoint_public_key(public_key):
                 continue
-            items.append({**manifest, "public_key": public_key, "online": self._relay_online(owner)})
+            items.append({**manifest, "public_key": public_key})
         return items
 
     def _endpoint_usable(self, client_id: str, *, include_pending: bool = False) -> bool:
@@ -110,7 +111,11 @@ class RelayRuntime:
             # The renderer needs the authoritative endpoint identity so it can
             # avoid offering self-destructive controls for the administrator.
             record = {"client_id": client_id, **record}
-            wisps = self.catalog_items() if admin else []
+            wisps = [
+                manifest
+                for manifest in self.state.wisps.values()
+                if self._relay_online(manifest.get("owner", ""))
+            ] if admin else []
             return {
                 "ok": True,
                 "client_id": client_id,
