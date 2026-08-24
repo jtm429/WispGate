@@ -370,21 +370,22 @@ class RelayRuntime:
                         [item.get("id") for item in catalog],
                     )
                     await send_json(writer, {"ok": True, "type": "wisps_registered", "items": catalog})
+                    # Catalog clients must remain subscribed after the initial
+                    # registration snapshot.  Relay liveness can become true
+                    # immediately after a Wisp registers, so closing ordinary
+                    # control clients here loses the catalog_update emitted by
+                    # handle_relay().
+                    self.control_sessions[client_id] = (client_id, writer)
                     await self.broadcast_catalog()
-                    if self._is_admin(client_id) or self.state.clients.get(client_id, {}).get("status") == "pending":
-                        if self._is_admin(client_id):
-                            self.control_sessions[client_id] = (client_id, writer)
-                        while line := await asyncio.wait_for(
-                            reader.readline(), timeout=self.HEARTBEAT_TIMEOUT_SECONDS
-                        ):
-                            control_message = json.loads(line)
-                            if control_message.get("type") == "ping":
-                                nonce = control_message.get("nonce")
-                                if isinstance(nonce, str) and 1 <= len(nonce) <= 128:
-                                    await send_json(writer, {"type": "pong", "nonce": nonce})
-                            elif control_message.get("type") == "management_request":
-                                response = self.management_request(client_id, control_message.get("request", {}))
-                                await send_json(writer, {"type": "management_response", **response})
+                    while line := await reader.readline():
+                        control_message = json.loads(line)
+                        if control_message.get("type") == "ping":
+                            nonce = control_message.get("nonce")
+                            if isinstance(nonce, str) and 1 <= len(nonce) <= 128:
+                                await send_json(writer, {"type": "pong", "nonce": nonce})
+                        elif control_message.get("type") == "management_request":
+                            response = self.management_request(client_id, control_message.get("request", {}))
+                            await send_json(writer, {"type": "management_response", **response})
 
             LOG.info("client joined: %s from %s", client_id, peer)
         except (KeyError, ValueError, json.JSONDecodeError, base64.binascii.Error, asyncio.TimeoutError) as exc:
